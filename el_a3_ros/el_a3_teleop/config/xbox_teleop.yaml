@@ -1,0 +1,13 @@
+xbox_teleop_node:
+  ros__parameters:
+    controller_profile: "xbox_default"
+    controller_name: "unknown"
+    joy_device: "/dev/input/js0"
+    update_rate: 50.0
+    max_linear_velocity: 0.15
+    max_angular_velocity: 1.5
+    deadzone: 0.15
+    input_smoothing: 0.35
+    filter_omega: 14.0
+    max_ik_jump: 0.5
+    trajectory_time_from_start: 0.08

@@ -1,0 +1,18 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: el_a3_dev
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/ws
+      - /dev:/dev
+    environment:
+      - ROS_DOMAIN_ID=0
+      - ROS_LOCALHOST_ONLY=0
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/ws/ros2_ws/fastrtps_no_shm.xml
+    command: bash

@@ -1,0 +1,19 @@
+pico_teleop_node:
+  ros__parameters:
+    hand: "right"
+    arm_controller_topic: "/arm_controller/joint_trajectory"
+    gripper_controller_topic: "/gripper_controller/joint_trajectory"
+    update_rate: 50.0
+    position_scale: 0.4
+    deadband: 0.005
+    pos_filter_alpha: 0.3
+    target_filter_alpha: 0.55
+    filter_omega: 14.0
+    max_ik_jump: 0.2
+    max_ee_speed: 0.50
+    max_joint_velocity: 2.5
+    trajectory_time_from_start: 0.08
+    workspace_radius: 0.50
+    yaw_scale: 0.5
+    yaw_deadband_deg: 2.0
+    yaw_stick_scale: 0.5

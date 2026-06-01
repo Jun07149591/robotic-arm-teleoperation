@@ -1,0 +1,184 @@
+89a90
+>         gravity_joint_scale: Optional[Dict[int, float]] = None,
+101a103,106
+>         backend: str = "socketcan",
+>         serial_port: Optional[str] = None,
+>         serial_baudrate: int = 2000000,
+>         can_bitrate: int = 1000000,
+134a140,144
+>             backend: CAN 驱动后端 ("socketcan" 或 "slcan")，默认 "socketcan"
+>             serial_port: SLCAN 串口名（如 "COM3"），backend="slcan" 时使用；
+>                          为 None 时使用 can_name 作为串口名
+>             serial_baudrate: SLCAN 串口通信波特率 (bps)，默认 2000000
+>             can_bitrate: CAN 总线波特率 (bps)，默认 1000000
+144,148c154,169
+<         self._driver = RobstrideCanDriver(
+<             can_name=can_name,
+<             host_can_id=host_can_id,
+<             motor_type_map=motor_type_map,
+<         )
+---
+>         if backend == "slcan":
+>             from el_a3_sdk.slcan_can_driver import SlcanCanDriver
+>             port = serial_port or can_name
+>             self._driver = SlcanCanDriver(
+>                 serial_port=port,
+>                 host_can_id=host_can_id,
+>                 motor_type_map=motor_type_map,
+>                 serial_baudrate=serial_baudrate,
+>                 can_bitrate=can_bitrate,
+>             )
+>         else:
+>             self._driver = RobstrideCanDriver(
+>                 can_name=can_name,
+>                 host_can_id=host_can_id,
+>                 motor_type_map=motor_type_map,
+>             )
+177a199
+>         self._gravity_joint_scale: Dict[int, float] = gravity_joint_scale or {}
+292c314
+<         for attempt in range(3):
+---
+>         for attempt in range(10):
+304c326
+<             time.sleep(0.05)
+---
+>             time.sleep(0.03)
+306c328,334
+<             logger.warning("无法获取电机反馈，_target_positions 使用默认值 [0]*6")
+---
+>             fallback = self._read_feedback_positions()
+>             with self._cmd_lock:
+>                 for i in range(self.NUM_ARM_JOINTS):
+>                     self._target_positions[i] = fallback[i]
+>                     self._gravity_input_positions[i] = fallback[i]
+>             logger.warning("GetArmJointMsgs 失败，使用单电机反馈: %s",
+>                            [f"{v:.3f}" for v in fallback])
+396a425,431
+>             fb_positions = self._read_feedback_positions()
+>             for i in range(self.NUM_ARM_JOINTS):
+>                 if abs(target_positions[i] - fb_positions[i]) > 0.5:
+>                     logger.warning(
+>                         "关节 %d 目标 %.3f 与反馈 %.3f 偏差过大，使用反馈值",
+>                         i + 1, target_positions[i], fb_positions[i])
+>                     target_positions[i] = fb_positions[i]
+398a434,435
+>             with self._cmd_lock:
+>                 self._target_positions = list(target_positions)
+417a455
+>         clamped_positions = list(target_positions)
+429a468
+>             clamped_positions[i] = pos
+445c484
+<                 grav_torque = gravity_torques[i] * direction if gravity_torques else 0.0
+---
+>                 grav_torque = gravity_torques[i] * direction * self._gravity_joint_scale.get(mid, 1.0) if gravity_torques else 0.0
+465c504
+<                 grav_torque = gravity_torques[i] * direction * self._gravity_feedforward_ratio if gravity_torques else 0.0
+---
+>                 grav_torque = gravity_torques[i] * direction * self._gravity_feedforward_ratio * self._gravity_joint_scale.get(mid, 1.0) if gravity_torques else 0.0
+471c510
+<         self._last_cmd_positions = list(target_positions)
+---
+>         self._last_cmd_positions = list(clamped_positions)
+599,602d637
+<                 time.sleep(0.005)
+<                 fb = self._driver.get_feedback(mid)
+<                 init_pos = fb.position if (fb and fb.is_valid) else 0.0
+<                 self._driver.send_motion_control(mid, init_pos, 0.0, 5.0, startup_kd, 0.0)
+842a878,880
+>             # 与 EnableArm 一致的鲁棒切换流程：清故障 + 30ms 等待 + 返回值检查 +
+>             # 写 CAN_TIMEOUT=0 (禁用看门狗)。否则小电机(EL05) 在残留故障时进入零
+>             # 力矩会保持 disabled 状态——表现为编码器反馈正常但电机不输出力矩。
+845,853c883,896
+<                 self._driver.disable_motor(mid, clear_fault=False)
+<                 time.sleep(0.01)
+<                 if is_gripper:
+<                     self._driver.set_run_mode(mid, RunMode.POSITION_PP)
+<                 else:
+<                     self._driver.set_run_mode(mid, RunMode.MOTION_CONTROL)
+<                 time.sleep(0.01)
+<                 self._driver.enable_motor(mid)
+<                 time.sleep(0.01)
+---
+>                 actual_mode = RunMode.POSITION_PP if is_gripper else RunMode.MOTION_CONTROL
+> 
+>                 self._driver.disable_motor(mid, clear_fault=True)
+>                 time.sleep(0.03)
+> 
+>                 if not self._driver.set_run_mode(mid, actual_mode):
+>                     logger.error("电机 %d 设置运行模式失败 (零力矩进入)", mid)
+>                     continue
+>                 time.sleep(0.03)
+> 
+>                 if not self._driver.enable_motor(mid):
+>                     logger.error("电机 %d 使能失败 (零力矩进入)", mid)
+>                     continue
+> 
+858a902,905
+>                 else:
+>                     self._driver.write_parameter(mid, ParamIndex.CAN_TIMEOUT, 0.0)
+>                     time.sleep(0.005)
+>                 time.sleep(0.03)
+859a907,908
+>             # 用 per-joint kd_max 作为自适应 Kd 的初始值（之前用全局值会导致首帧
+>             # 超过 per-joint 上限，再 EMA 收敛要 1~2 秒）
+861c910,912
+<                 self._adaptive_kd_values[i] = self._zero_torque_kd_max
+---
+>                 mid = i + 1
+>                 self._adaptive_kd_values[i] = self._per_joint_kd_max.get(
+>                     mid, self._zero_torque_kd_max)
+873a925,940
+> 
+>             # 诊断：进入零力矩后立即查询电机 4 的实际 RUN_MODE 和故障码
+>             try:
+>                 rm = self._driver.read_parameter(4, ParamIndex.RUN_MODE, timeout=0.3)
+>                 fd = self._driver.get_fault_detail(4)
+>                 fb4 = self._driver.get_feedback(4)
+>                 rm_val = int(rm.value) if rm else -1
+>                 logger.warning(
+>                     "[诊断] 电机4 进入零力矩后: RUN_MODE=%s, fault_detail=0x%X, fb_valid=%s, fb_pos=%.3f",
+>                     rm_val if rm_val >= 0 else "READ_FAIL",
+>                     fd & 0xFFFFFFFF,
+>                     bool(fb4 and fb4.is_valid),
+>                     fb4.position if fb4 else float("nan"),
+>                 )
+>             except Exception as e:
+>                 logger.warning("[诊断] 电机4 状态查询失败: %s", e)
+962a1030,1032
+>         # 诊断：每 1 秒打一次 4 号电机收到的实际指令 + 反馈
+>         diag_last_t = 0.0
+>         diag_interval = 1.0
+968c1038
+<             grav = list(arm_grav) + [0.0] * (self.NUM_JOINTS - len(arm_grav))
+---
+>             grav = list[float](arm_grav) + [0.0] * (self.NUM_JOINTS - len(arm_grav))
+974c1044,1046
+<                 motor_torque = grav[i] * direction
+---
+>                 # 与控制环零力矩路径(line ~484)保持一致：应用每关节重力补偿缩放
+>                 joint_scale = self._gravity_joint_scale.get(mid, 1.0)
+>                 motor_torque = grav[i] * direction * joint_scale
+986a1059,1074
+>                 # 诊断：每 1 秒打印 4 号电机的指令和反馈
+>                 if mid == 4:
+>                     now = time.time()
+>                     if now - diag_last_t >= diag_interval:
+>                         diag_last_t = now
+>                         fb_torque = fb.torque if (fb and fb.is_valid) else float("nan")
+>                         logger.warning(
+>                             "[诊断] 电机4: cmd_kd=%.4f cmd_grav=%.3fNm | fb_pos=%.3f fb_vel=%.3f fb_tau=%.3f valid=%s | grav_raw=%.3f scale=%.2f dir=%.0f",
+>                             use_kd, motor_torque,
+>                             fb.position if fb else 0.0,
+>                             fb.velocity if fb else 0.0,
+>                             fb_torque,
+>                             bool(fb and fb.is_valid),
+>                             grav[i], joint_scale, direction,
+>                         )
+> 
+1144a1233,1236
+> 
+>     def WriteMotorParameterInt(self, motor_id: int, param_index: int, value: int) -> bool:
+>         """写入整数类型参数（uint8/uint16/uint32）"""
+>         return self._driver.write_parameter_int(motor_id, param_index, value)

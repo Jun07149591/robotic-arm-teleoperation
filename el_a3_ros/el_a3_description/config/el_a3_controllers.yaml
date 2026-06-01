@@ -1,0 +1,102 @@
+# ros2_control controller configuration for EL-A3 robot arm
+
+controller_manager:
+  ros__parameters:
+    update_rate: 200  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    gripper_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    zero_torque_controller:
+      type: el_a3_hardware/ZeroTorqueController
+
+joint_state_broadcaster:
+  ros__parameters:
+    publish_rate: 100.0
+
+arm_controller:
+  ros__parameters:
+    joints:
+      - L1_joint
+      - L2_joint
+      - L3_joint
+      - L4_joint
+      - L5_joint
+      - L6_joint
+
+    command_interfaces:
+      - position
+      - velocity
+
+    state_interfaces:
+      - position
+      - velocity
+
+    open_loop_control: true
+    allow_nonzero_velocity_at_trajectory_end: true
+    interpolation_method: splines
+
+    state_publish_rate: 200.0
+    action_monitor_rate: 50.0
+
+    constraints:
+      stopped_velocity_tolerance: 0.1
+      goal_time: 0.0
+      L1_joint:
+        goal: 0.03
+      L2_joint:
+        goal: 0.03
+      L3_joint:
+        goal: 0.03
+      L4_joint:
+        goal: 0.03
+      L5_joint:
+        goal: 0.03
+      L6_joint:
+        goal: 0.03
+
+gripper_controller:
+  ros__parameters:
+    joints:
+      - L7_joint
+
+    command_interfaces:
+      - position
+
+    state_interfaces:
+      - position
+      - velocity
+
+    open_loop_control: true
+    allow_nonzero_velocity_at_trajectory_end: true
+    interpolation_method: splines
+
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+
+    constraints:
+      stopped_velocity_tolerance: 0.2
+      goal_time: 0.0
+      L7_joint:
+        goal: 0.05
+
+zero_torque_controller:
+  ros__parameters:
+    joints:
+      - L1_joint
+      - L2_joint
+      - L3_joint
+      - L4_joint
+      - L5_joint
+      - L6_joint
+      - L7_joint
+    kd: 1.0
+    # Resolved dynamically in launch files via get_package_share_directory()
+    urdf_path: ""
+    inertia_config_path: ""
