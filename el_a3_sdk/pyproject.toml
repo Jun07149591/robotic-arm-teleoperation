@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "el_a3_sdk"
+version = "1.0.0"
+description = "EL-A3 7-DOF Robotic Arm Pure Python SDK (Direct CAN, multi-arm)"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "EL-A3 Team" },
+]
+dependencies = [
+    "numpy<2",
+    "pyyaml",
+    "pyrealsense2",
+    "open3d",
+    "opencv-python",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[project.optional-dependencies]
+dynamics = ["pin"]
+slcan = ["pyserial>=3.5"]
+windows = ["pyserial>=3.5"]
+realsense = []
+camera = []
+camera-test = []
+debugger = [
+    "pyqt6",
+    "pyqtgraph",
+    "pyvista",
+    "pyvistaqt",
+]
+
+[project.scripts]
+el-a3-debugger = "MotorStudio.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "el_a3_sdk*",
+    "MotorStudio*",
+    "demo*",
+]
