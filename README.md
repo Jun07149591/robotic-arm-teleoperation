@@ -139,10 +139,3 @@ python3 el_a3_sdk/demo/pico_control.py --sim
 - `el_a3_ros/el_a3_teleop/launch/pico_teleop_dual.launch.py`
 - `el_a3_ros/el_a3_teleop/launch/pico_teleop_mock.launch.py`
 
-## 9. 和参考项目的关系
-
-这套流程参考了 `https://github.com/Beiyu-kk/bookarm-control-py` 的 WebXR 遥操作方式，但当前仓库是面向 AE/EL-A3 机械臂的实现，使用的是这里自己的 ROS 2 和 SDK 控制链路。
-
-## 10. 一句话总结
-
-先让 PICO 把位姿发出来，再启动遥操作程序读取它，按住握持键后移动手柄，就能直接控制 AE 机械臂末端。
