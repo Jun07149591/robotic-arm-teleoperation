@@ -5,7 +5,7 @@
 通过 Pico VR 头显的 WebXR 手柄实现 EL-A3 机械臂的实时遥操作控制。
 
 提供两种运行方式：
-- **SDK 模式**（`demo/pico_control.py`）：纯 SDK，无需 ROS，适合快速测试和实机
+- **SDK 模式**（`demo/pico_control_jointctrl.py`）：纯 SDK，无需 ROS，适合快速测试和实机
 - **ROS 模式**（`ros2 launch`）：集成 ros2_control + RViz 可视化 + mock hardware
 
 两种模式均支持双机械臂：左手柄控制左臂，右手柄控制右臂。
@@ -19,7 +19,7 @@ Pico 头显浏览器 (WebXR)  →  WebSocket  →  pico3_webxr_pose_receiver.py
                                               ↓
                           ┌───────────────────┴───────────────────┐
                           ↓                                       ↓
-                  pico_control.py (SDK)              pico_teleop_node (ROS)
+                  pico_control_jointctrl.py (SDK)    pico_teleop_node (ROS)
                           ↓                                       ↓
                      ELA3Interface                    /arm_controller/joint_trajectory
                      (CAN 直连)                              ↓
@@ -65,7 +65,7 @@ python pico3_webxr_pose_receiver.py
 
 # 终端 2：仿真
 cd el_a3_sdk
-python demo/pico_control.py --sim
+python demo/pico_control_jointctrl.py --sim
 ```
 
 ### 实机
@@ -76,15 +76,15 @@ sudo ip link set can1 up type can bitrate 1000000
 
 cd el_a3_sdk
 # 双机械臂
-python demo/pico_control.py --can-left can0 --can-right can1
+python demo/pico_control_jointctrl.py --can-left can0 --can-right can1
 # 单机械臂
-python demo/pico_control.py --can can0
+python demo/pico_control_jointctrl.py --can can0
 ```
 
 ### 命令行参数
 
 ```
-python pico_control.py [选项]
+python pico_control_jointctrl.py [选项]
 
   --sim               仿真模式（无需 CAN 硬件，纯 FK/IK 模拟）
   --can CAN           单臂模式 CAN 接口
@@ -171,13 +171,17 @@ ros2 launch el_a3_teleop pico_teleop.launch.py can_interface:=can0
 | Pico 按键 | 位置 | 功能 |
 |----------|------|------|
 | btn[1] **背部握持键** | 中指位置 | **按住 1 秒**开启跟踪，松开关闭（手臂保持位置） |
-| btn[0] **侧边扳机** | 食指位置 | 按住夹爪闭合，松开夹爪停止 |
+| 摇杆上下推 | 拇指摇杆 | 上推夹爪闭合，下推夹爪打开 |
+| 摇杆左右推 | 拇指摇杆 | 基座 yaw 旋转 |
+| btn[0] **侧边扳机** | 食指位置 | 扣住 0.3 秒进入精细 Yaw 模式，松开退出 |
 | btn[4] **A (右) / X (左)** | 正面 | MoveJ 回零位 |
 | btn[5] **B (右) / Y (左)** | 正面 | MoveJ 回 Home |
-| btn[3] **摇杆按下** | — | 左手切换速度档位，右手急停 |
+| btn[3] **摇杆按下** | — | 左手切换零力矩模式，右手急停 |
 
 - **背部握持键**：跟踪开启后，手部移动 → 机械臂末端对应移动。松开立刻停住保持位置。
-- **侧边扳机**：仅右手。按住夹爪持续闭合，松开停止。
+- **摇杆上下推**：每只手柄控制对应机械臂夹爪，上推持续闭合，下推持续打开。
+- **摇杆左右推**：控制对应机械臂绕基座 yaw 旋转。
+- **侧边扳机**：进入精细 Yaw 模式后位置冻结，只跟随手腕扭转。
 - **A (右) / X (左)**：对应臂 MoveJ 回到零关节位置 `[0,0,0,0,0,0]`。
 - **B (右) / Y (左)**：对应臂 MoveJ 回到 Home `[0, 45°, -45°, 0, 0, 0]`。
 
@@ -302,7 +306,7 @@ unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH
 
 | 文件 | 位置 | 说明 |
 |------|------|------|
-| Pico SDK 控制程序 | `el_a3_sdk/demo/pico_control.py` | SDK 模式（--sim + 实机） |
+| Pico SDK 控制程序 | `el_a3_sdk/demo/pico_control_jointctrl.py` | SDK 模式（--sim + 实机） |
 | Pico ROS 遥操作节点 | `el_a3_ros/el_a3_teleop/el_a3_teleop/pico_teleop_node.py` | ROS 2 节点 |
 | Pico ROS 启动文件 | `el_a3_ros/el_a3_teleop/launch/pico_teleop.launch.py` | ros2 launch 入口 |
 | Pico ROS 配置文件 | `el_a3_ros/el_a3_teleop/config/pico_teleop.yaml` | 节点参数 |

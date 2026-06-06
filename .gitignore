@@ -43,3 +43,58 @@ el_a3_sdk/recordings/
 # cache
 __pycache__/
 *.pyc
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ROS2
+build/
+install/
+log/
+
+# datasets
+teleop_data_collection/datasets/
+data/
+dataset/
+datasets/
+
+# output/log
+logs/
+runs/
+output/
+results/
+videos/
+
+# compressed files
+*.zip
+*.rar
+*.tar
+*.tar.gz
+*.7z
+
+# model weights
+*.pth
+*.pt
+*.onnx
+*.engine
+*.ckpt
+*.bin
+*.safetensors
+
+# CAD large files
+hardware/step/
+hardware/3mf/
+*.step
+*.STEP
+*.stp
+*.STP
+*.3mf
+*.SLDPRT
+*.sldprt
+
+# editor/system
+.vscode/
+.idea/
+.DS_Store

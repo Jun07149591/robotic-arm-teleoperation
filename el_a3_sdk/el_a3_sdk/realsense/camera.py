@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, Literal, Optional, Tuple, Union
 
@@ -476,14 +477,36 @@ class RealSenseD435:
         self._profile = None
         self._depth_scale = None
 
-    def warmup(self, frame_count: int = 30, timeout_ms: int = 5000) -> None:
+    def warmup(
+        self,
+        frame_count: int = 30,
+        timeout_ms: int = 5000,
+        startup_retry_count: int = 2,
+        retry_delay_s: float = 0.2,
+    ) -> None:
         """Drop startup frames so auto exposure can settle."""
 
         if frame_count <= 0:
             return
         self._ensure_started()
-        for _ in range(frame_count):
-            self._pipeline.wait_for_frames(timeout_ms)
+        retries_left = max(0, int(startup_retry_count))
+        for frame_idx in range(frame_count):
+            while True:
+                try:
+                    self._pipeline.wait_for_frames(timeout_ms)
+                    break
+                except RuntimeError as exc:
+                    if retries_left <= 0:
+                        raise RuntimeError(
+                            "RealSense warmup failed: "
+                            f"serial={getattr(self, 'serial', None) or '<default>'}, "
+                            f"frame={frame_idx + 1}/{frame_count}, "
+                            f"timeout_ms={timeout_ms}, "
+                            f"last_error={exc}"
+                        ) from exc
+                    retries_left -= 1
+                    if retry_delay_s > 0:
+                        time.sleep(float(retry_delay_s))
 
     def get_frame(self, timeout_ms: int = 5000) -> RGBDFrame:
         """Capture one synchronized RGB-D frame."""

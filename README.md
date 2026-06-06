@@ -9,7 +9,7 @@
 PICO 头显浏览器
   -> pico3_webxr_pose_receiver.py
   -> /tmp/pico_latest_pose.json
-  -> pico_teleop_node.py 或 demo/pico_control.py
+  -> pico_teleop_node.py 或 demo/pico_control_jointctrl.py
   -> 机械臂关节控制
 ```
 
@@ -29,7 +29,7 @@ PICO 头显浏览器
 
 适合直接连 CAN 的场景。
 
-- 运行 `el_a3_sdk/demo/pico_control.py`
+- 运行 `el_a3_sdk/demo/pico_control_jointctrl.py`
 - 不依赖 ROS
 - 支持单臂和双臂
 
@@ -68,19 +68,19 @@ ros2 launch el_a3_teleop pico_teleop_dual.launch.py use_mock_hardware:=true
 ### 单臂
 
 ```bash
-python3 el_a3_sdk/demo/pico_control.py --can can0
+python3 el_a3_sdk/demo/pico_control_jointctrl.py --can can0
 ```
 
 ### 双臂
 
 ```bash
-python3 el_a3_sdk/demo/pico_control.py --can-left can0 --can-right can1
+python3 el_a3_sdk/demo/pico_control_jointctrl.py --can-left can0 --can-right can1
 ```
 
 ### 仿真
 
 ```bash
-python3 el_a3_sdk/demo/pico_control.py --sim
+python3 el_a3_sdk/demo/pico_control_jointctrl.py --sim
 ```
 
 ## 6. 遥操作怎么用
@@ -138,4 +138,32 @@ python3 el_a3_sdk/demo/pico_control.py --sim
 - `el_a3_ros/el_a3_teleop/launch/pico_teleop.launch.py`
 - `el_a3_ros/el_a3_teleop/launch/pico_teleop_dual.launch.py`
 - `el_a3_ros/el_a3_teleop/launch/pico_teleop_mock.launch.py`
+
+## 9. 数据采集（训练 VLA 用）
+
+遥操作的同时录制训练数据，输出 **LeRobot v3.0** 兼容格式（Parquet + MP4）。
+
+**做完任务 → 长按 A 失能 → 自动保存**，全程不碰键盘：
+
+```bash
+# 终端 1：遥操作（带状态导出）
+python el_a3_sdk/demo/pico_control_jointctrl.py --can can0 \
+  --state-export /tmp/robot_latest_state.json
+
+# 终端 2：采集（纯观察者，不连 CAN）
+python teleop_data_collection/scripts/record_sdk_episode.py \
+  --camera-serial 260322277792 \
+  --state-file /tmp/robot_latest_state.json \
+  --repo-id my_dataset \
+  --task "pick up the object" \
+  --hz 15 --fps 30 --max-duration 60
+```
+
+| 终止方式 | 触发 | success |
+|---------|------|---------|
+| 长按 A (右手) | 机械臂失能 | ✅ 自动 |
+| `--max-duration N` | 超时兜底 | ❌ |
+| Ctrl+C | 手动 | ❌ |
+
+详见 [`teleop_data_collection/README.md`](teleop_data_collection/README.md)。
 

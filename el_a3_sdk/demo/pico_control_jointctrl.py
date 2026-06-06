@@ -44,10 +44,10 @@ import argparse
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 
-from el_a3_sdk import ELA3Interface, ArmEndPose, LogLevel
+from el_a3_sdk import ELA3Interface, ArmEndPose, LogLevel, ArmState
 from el_a3_sdk.kinematics import ELA3Kinematics
 
-logger = logging.getLogger("pico_control")
+logger = logging.getLogger("pico_control_jointctrl")
 
 # ================================================================
 # Simulated Arm (for --sim mode)
@@ -217,12 +217,18 @@ GRIP_LONG_PRESS_SEC = 0.3
 
 # ---- Pico data helpers ----
 
-def _read_pico_pose() -> Optional[Dict[str, Any]]:
-    try:
-        with open(POSE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
+def _read_pico_pose(retries: int = 2, retry_delay: float = 0.001) -> Optional[Dict[str, Any]]:
+    for attempt in range(max(1, retries)):
+        try:
+            with open(POSE_FILE, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError):
+            if attempt + 1 >= max(1, retries):
+                return None
+            time.sleep(retry_delay)
+    return None
 
 
 def _extract_grip_pose(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -252,6 +258,44 @@ def _extract_axes(source: Dict[str, Any]) -> List[float]:
     if not gp:
         return []
     return gp.get("axes", [])
+
+
+def _thumbstick_axes(axes: List[float]) -> Tuple[float, float]:
+    """Return the active thumbstick x/y pair across Pico/WebXR axis layouts."""
+    if len(axes) >= 4:
+        primary = (float(axes[0]), float(axes[1]))
+        xr_standard = (float(axes[2]), float(axes[3]))
+        if max(abs(xr_standard[0]), abs(xr_standard[1])) > max(abs(primary[0]), abs(primary[1])):
+            return xr_standard
+        return primary
+    if len(axes) >= 2:
+        return float(axes[0]), float(axes[1])
+    return 0.0, 0.0
+
+
+def _reject_viewer_correlated_delta(
+    hand_delta: List[float],
+    viewer_delta: Optional[List[float]],
+) -> List[float]:
+    """Remove controller drift that is almost the same motion as the headset."""
+    if viewer_delta is None:
+        return hand_delta
+    v_norm2 = sum(v * v for v in viewer_delta)
+    if v_norm2 < 1e-6:
+        return hand_delta
+    h_norm2 = sum(v * v for v in hand_delta)
+    if h_norm2 < 1e-9:
+        return hand_delta
+    dot = sum(hand_delta[i] * viewer_delta[i] for i in range(3))
+    if dot <= 0.0:
+        return hand_delta
+    h_norm = math.sqrt(h_norm2)
+    v_norm = math.sqrt(v_norm2)
+    corr = dot / max(h_norm * v_norm, 1e-9)
+    projection = dot / v_norm2
+    if corr < 0.85 or projection < 0.5 or projection > 1.5:
+        return hand_delta
+    return [hand_delta[i] - projection * viewer_delta[i] for i in range(3)]
 
 
 def quat_multiply(a: Tuple[float, ...], b: Tuple[float, ...]) -> Tuple[float, float, float, float]:
@@ -284,9 +328,9 @@ def quat_to_rpy(q: Tuple[float, ...]) -> Tuple[float, float, float]:
 
 def _map_hand_delta_to_robot_delta(hand_delta: List[float]) -> List[float]:
     """Map WebXR hand translation delta to robot base translation delta."""
-    # WebXR: +X right, +Y up, -Z forward.
-    # Robot: -X forward, -Y left, +Z up.
-    return [hand_delta[2], hand_delta[0], hand_delta[1]]
+    # Current Pico/WebXR setup axis order relative to desired robot teleop:
+    # -hand X = left/right, hand Z = up/down, hand Y = front/back.
+    return [-hand_delta[0], hand_delta[2], hand_delta[1]]
 
 
 # ================================================================
@@ -676,7 +720,8 @@ class _ArmController:
         input_alpha: float,
         filter_omega: float,
         max_ik_jump: float,
-        yaw_scale: float = 0.5,
+        yaw_scale: float = 1.0,
+        joint_max_vel: float = 0.2,
     ):
         self.name = name
         self._arm = arm
@@ -690,6 +735,7 @@ class _ArmController:
         self._filter_omega = filter_omega
         self._max_ik_jump = max_ik_jump
         self._yaw_scale = yaw_scale
+        self._joint_max_vel = float(joint_max_vel)
         self._yaw_stick_scale = 1.5
         self._stick_x_ema = 0.0
         self._yaw_active = False
@@ -701,6 +747,8 @@ class _ArmController:
         self.is_estop = False
         self._calibrated = False
         self._prev_hand_pos: Optional[List[float]] = None  # for per-frame delta
+        self._last_raw_hand_pos: Optional[List[float]] = None
+        self._hand_filtered: Optional[List[float]] = None
         self._sv_vel: Optional[List[float]] = None  # EMA-smoothed velocity
         self._target_pose: Optional[ArmEndPose] = None
         self._smooth_pose: Optional[ArmEndPose] = None  # LPF平滑后的目标位姿
@@ -718,6 +766,9 @@ class _ArmController:
         self._consecutive_ik_fails = 0
         self._seed_just_init = False
         self._resync_cooldown = 0
+        self._joint_ma_window: List[List[float]] = []
+        self._joint_ma_weights = [0.4, 0.3, 0.2, 0.1]
+        self._last_joint_cmd: Optional[List[float]] = None
 
         # EMA
         self._sv = [0.0] * 6
@@ -773,9 +824,7 @@ class _ArmController:
         q = self._arm.GetArmJointMsgs().to_list()[:6]
         logger.info("[%s] 从当前关节位置初始化: %s", self.name,
                     [f"{v*180/math.pi:.1f}°" for v in q])
-        # Send initial command to transition arm state from IDLE → MOTION_CONTROL
-        self._arm.JointCtrl(*q, velocities=[0.0] * 6)
-        time.sleep(0.1)
+        self._last_joint_cmd = list(q)
         self._ik_seed = list(q)
         self._ik_raw = list(q)
         self._ik_filter_pos = list(q)
@@ -787,6 +836,7 @@ class _ArmController:
         self._ref_quat = None
         self._ref_hand_rpy: Optional[List[float]] = None  # [roll, pitch, yaw] in VR space
         self._prev_hand_pos = None
+        self._last_raw_hand_pos = None
         self._joint_ma_window = []
         self._ee_target_raw = None
         self._ee_target_filtered = None
@@ -806,6 +856,8 @@ class _ArmController:
         self._ref_quat = (pose["qx"], pose["qy"], pose["qz"], pose["qw"])
         hp = [pose["x"], pose["y"], pose["z"]]
         self._prev_hand_pos = list(hp)
+        self._last_raw_hand_pos = list(hp)
+        self._hand_filtered = list(hp)
         self._joint_ma_window = []
         self._calibrated = True
         logger.info("[%s] 标定完成: hand_pos=(%.3f, %.3f, %.3f)",
@@ -815,6 +867,8 @@ class _ArmController:
         self._ref_quat = None
         self._ref_hand_rpy = None
         self._prev_hand_pos = None
+        self._last_raw_hand_pos = None
+        self._hand_filtered = None
         self._joint_ma_window = []
         self._calibrated = False
 
@@ -833,6 +887,8 @@ class _ArmController:
             self._ik_filter_pos = list(positions)
             self._ik_filter_vel = [0.0] * 6
             self._hold_q = list(positions)
+            self._joint_ma_window = []
+            self._last_joint_cmd = list(positions)
             self._seed_just_init = True
             self._consecutive_rejects = 0
             self._consecutive_ik_fails = 0
@@ -892,7 +948,7 @@ class _ArmController:
     def recover_from_estop(self):
         self._arm.EnableArm()
         time.sleep(0.3)
-        self._arm.start_control_loop(rate_hz=500.0)
+        self._arm.start_control_loop(rate_hz=200.0)
         self.is_estop = False
 
     def set_payload_mode(self, enabled: bool):
@@ -921,7 +977,12 @@ class _ArmController:
             self._payload_mode = False
             logger.info("[%s] 负载模式 OFF → 恢复正常参数", self.name)
 
-    def process_pose(self, pose: Dict[str, Any], speed_factor: float) -> bool:
+    def process_pose(
+        self,
+        pose: Dict[str, Any],
+        speed_factor: float,
+        viewer_delta: Optional[List[float]] = None,
+    ) -> bool:
         """Incremental delta → Unitree-style joint filtering + velocity clip."""
         if self.is_moving or self.is_estop or self._kin is None or self._target_pose is None:
             return False
@@ -935,13 +996,20 @@ class _ArmController:
 
         # Fine yaw mode: skip position tracking, only update wrist yaw
         if not self._fine_yaw_mode:
-            cur_hand = [pose["x"], pose["y"], pose["z"]]
+            raw_hand = [pose["x"], pose["y"], pose["z"]]
+            if self._hand_filtered is None:
+                self._hand_filtered = list(raw_hand)
+            else:
+                alpha = max(0.05, min(0.8, self._input_alpha))
+                for i in range(3):
+                    self._hand_filtered[i] += alpha * (raw_hand[i] - self._hand_filtered[i])
+            cur_hand = list(self._hand_filtered)
 
             # Skip first N frames after tracking engage
             if self._skip_frames > 0:
                 self._skip_frames -= 1
                 self._prev_hand_pos = list(cur_hand)
-                self._send_filtered()
+                self._last_raw_hand_pos = list(raw_hand)
                 return True
 
             # Downsample: only process every Nth new Pico packet (~10Hz effective)
@@ -952,30 +1020,55 @@ class _ArmController:
             self._sample_counter = 0
 
             # Per-frame delta
+            if self._last_raw_hand_pos is None:
+                self._last_raw_hand_pos = list(raw_hand)
+                self._prev_hand_pos = list(cur_hand)
+                self._send_filtered()
+                return True
             if self._prev_hand_pos is None:
                 self._prev_hand_pos = list(cur_hand)
                 self._send_filtered()
                 return True
 
-            hand_delta = [cur_hand[i] - self._prev_hand_pos[i] for i in range(3)]
+            hand_delta = [raw_hand[i] - self._last_raw_hand_pos[i] for i in range(3)]
+            hand_delta = _reject_viewer_correlated_delta(hand_delta, viewer_delta)
+            self._last_raw_hand_pos = list(raw_hand)
             self._prev_hand_pos = list(cur_hand)
+
+            delta_norm = math.sqrt(sum(v * v for v in hand_delta))
+            delta_deadband = min(max(self._dz_threshold, 0.0), 0.003)
+            if delta_norm < delta_deadband:
+                hand_delta = [0.0, 0.0, 0.0]
+            elif delta_deadband > 0.0:
+                scale_out = (delta_norm - delta_deadband) / max(delta_norm, 1e-9)
+                hand_delta = [v * scale_out for v in hand_delta]
 
             robot_delta = _map_hand_delta_to_robot_delta(hand_delta)
 
             if self._sv_vel is None:
                 self._sv_vel = [0.0, 0.0, 0.0]
-            VEL_EMA = 0.25
             danger = min(1.0, max(0.0, (self._last_ik_err - 0.003) / 0.012))
             brake = 1.0 - danger * 0.75
             scale = self._pos_scale * brake
-            raw_vel = [d / max(self._dt, 1e-6) * scale for d in robot_delta]
-            for i in range(3):
-                raw_vel[i] = max(-1.0, min(1.0, raw_vel[i]))
-                self._sv_vel[i] = VEL_EMA * raw_vel[i] + (1 - VEL_EMA) * self._sv_vel[i]
+            raw_step = [d * scale for d in robot_delta]
+            # Safety cap for a single Pico packet. This avoids large tracking
+            # jumps without shrinking normal hand deltas by the 100Hz loop dt.
+            max_step = max(0.08, self._max_lin_vel * 1.5)
+            step_norm = math.sqrt(sum(v * v for v in raw_step))
+            if step_norm <= 1e-9:
+                self._sv_vel = [0.0, 0.0, 0.0]
+            else:
+                if step_norm > max_step:
+                    step_scale = max_step / max(step_norm, 1e-9)
+                    raw_step = [v * step_scale for v in raw_step]
 
-            self._target_pose.x += self._sv_vel[0] * self._dt
-            self._target_pose.y += self._sv_vel[1] * self._dt
-            self._target_pose.z += self._sv_vel[2] * self._dt
+                STEP_EMA = 0.8
+                for i in range(3):
+                    self._sv_vel[i] = STEP_EMA * raw_step[i] + (1 - STEP_EMA) * self._sv_vel[i]
+
+                self._target_pose.x += self._sv_vel[0]
+                self._target_pose.y += self._sv_vel[1]
+                self._target_pose.z += self._sv_vel[2]
 
         # Full RPY rotation tracking: only active in fine-yaw mode (trigger held)
         if self._fine_yaw_mode:
@@ -984,16 +1077,16 @@ class _ArmController:
             droll  = cur_roll  - self._ref_hand_rpy[0]
             dpitch = cur_pitch - self._ref_hand_rpy[1]
             dyaw   = cur_yaw   - self._ref_hand_rpy[2]
-            DEADBAND_DEG = 2.0
+            DEADBAND_DEG = 0.5
             if abs(droll)  < math.radians(DEADBAND_DEG): droll  = 0.0
             if abs(dpitch) < math.radians(DEADBAND_DEG): dpitch = 0.0
             if abs(dyaw)   < math.radians(DEADBAND_DEG): dyaw   = 0.0
             # VR → robot rotation mapping (1:1):
             #   VR roll  (X) → robot rx
             #   VR pitch (Y) → robot rz
-            #   VR yaw   (Z) → robot ry
+            #   VR yaw   (Z) → robot -ry
             self._target_pose.rx = self._ref_robot_rpy[0] + droll  * self._yaw_scale
-            self._target_pose.ry = self._ref_robot_rpy[1] + dyaw   * self._yaw_scale
+            self._target_pose.ry = self._ref_robot_rpy[1] - dyaw   * self._yaw_scale
             self._target_pose.rz = self._ref_robot_rpy[2] + dpitch * self._yaw_scale
 
         # IK
@@ -1046,6 +1139,8 @@ class _ArmController:
         self._ik_raw = list(q_avg)
         self._ik_filter_pos = list(q_avg)
         self._hold_q = list(q_avg)
+        self._joint_ma_window = []
+        self._last_joint_cmd = list(q_avg)
         for i in range(6):
             self._ik_filter_vel[i] *= 0.2
         self._seed_just_init = True
@@ -1061,12 +1156,42 @@ class _ArmController:
             self._ee_target_filtered = None
             self._prev_pose = None
 
-    def _send_filtered(self):
-        if self._ik_raw is not None:
-            if self._ik_filter_pos is None:
-                self._ik_filter_pos = list(self._ik_raw)
-                self._ik_filter_vel = [0.0] * 6
+    def _weighted_joint_target(self, q_raw: List[float]) -> List[float]:
+        self._joint_ma_window.append(list(q_raw[:6]))
+        if len(self._joint_ma_window) > len(self._joint_ma_weights):
+            self._joint_ma_window.pop(0)
 
+        usable = min(len(self._joint_ma_window), len(self._joint_ma_weights))
+        weights = self._joint_ma_weights[:usable]
+        norm = sum(weights)
+        q_out = [0.0] * 6
+        for k, weight in enumerate(weights):
+            q_sample = self._joint_ma_window[-1 - k]
+            for i in range(6):
+                q_out[i] += (weight / norm) * q_sample[i]
+        return q_out
+
+    def _clip_joint_target_from_feedback(self, q_target: List[float]) -> List[float]:
+        q_now = self._last_joint_cmd or self._hold_q or self._ik_filter_pos or q_target
+
+        max_step = max(0.0005, self._joint_max_vel * max(self._dt, 1e-6))
+        delta = [q_target[i] - q_now[i] for i in range(6)]
+        max_abs_delta = max(abs(v) for v in delta)
+        if max_abs_delta <= max_step:
+            return list(q_target[:6])
+        scale = max_abs_delta / max_step
+        return [q_now[i] + delta[i] / scale for i in range(6)]
+
+    def _send_filtered(self):
+        """Second-order joint smoothing + velocity feedforward JointCtrl."""
+        if self._ik_raw is None and self._ik_filter_pos is None:
+            return
+
+        if self._ik_filter_pos is None and self._ik_raw is not None:
+            self._ik_filter_pos = list(self._ik_raw)
+            self._ik_filter_vel = [0.0] * 6
+
+        if self._ik_raw is not None:
             omega = self._filter_omega
             dt = self._dt
             a = omega * dt
@@ -1074,33 +1199,91 @@ class _ArmController:
             for i in range(6):
                 err = self._ik_raw[i] - self._ik_filter_pos[i]
                 vel = self._ik_filter_vel[i]
-                self._ik_filter_pos[i] = self._ik_raw[i] - ea * ((1.0 + a) * err - dt * vel)
-                self._ik_filter_vel[i] = ea * (omega * omega * dt * err + (1.0 - a) * vel)
-
+                err_new = ea * ((1.0 + a) * err - dt * vel)
+                vel_new = ea * (omega * omega * dt * err + (1.0 - a) * vel)
+                self._ik_filter_pos[i] = self._ik_raw[i] - err_new
+                self._ik_filter_vel[i] = vel_new
             self._hold_q = list(self._ik_filter_pos)
 
-        if self._target_pose is not None:
-            # 方案1: 轨迹延长到50ms, 避免频繁归零
-            # 方案2: 目标位姿一阶LPF, 让input连续而非跳变
-            if self._smooth_pose is None:
-                self._smooth_pose = ArmEndPose(
-                    x=self._target_pose.x, y=self._target_pose.y, z=self._target_pose.z,
-                    rx=self._target_pose.rx, ry=self._target_pose.ry, rz=self._target_pose.rz)
-            else:
-                alpha = 0.45
-                self._smooth_pose.x += alpha * (self._target_pose.x - self._smooth_pose.x)
-                self._smooth_pose.y += alpha * (self._target_pose.y - self._smooth_pose.y)
-                self._smooth_pose.z += alpha * (self._target_pose.z - self._smooth_pose.z)
-                self._smooth_pose.rx += alpha * (self._target_pose.rx - self._smooth_pose.rx)
-                self._smooth_pose.ry += alpha * (self._target_pose.ry - self._smooth_pose.ry)
-                self._smooth_pose.rz += alpha * (self._target_pose.rz - self._smooth_pose.rz)
+        state = getattr(self._arm, "arm_state", None)
+        if state is not None and state not in (ArmState.ENABLED, ArmState.RUNNING):
+            return
+        q_cmd = self._clip_joint_target_from_feedback(self._ik_filter_pos)
+        if self._last_joint_cmd is None:
+            vel_cmd = list(self._ik_filter_vel or [0.0] * 6)
+        else:
+            dt = max(self._dt, 1e-6)
+            vel_cmd = [(q_cmd[i] - self._last_joint_cmd[i]) / dt for i in range(6)]
+        max_ff = max(self._joint_max_vel, 0.05)
+        vel_cmd = [max(-max_ff, min(max_ff, v)) for v in vel_cmd]
+        self._arm.JointCtrl(*q_cmd, velocities=vel_cmd)
+        self._last_joint_cmd = list(q_cmd)
 
-            cur = (self._smooth_pose.x, self._smooth_pose.y, self._smooth_pose.z,
-                   self._smooth_pose.rx, self._smooth_pose.ry, self._smooth_pose.rz)
-            if cur == self._last_sent_pose_tuple:
-                return
-            self._last_sent_pose_tuple = cur
-            self._arm.MoveL(self._smooth_pose, duration=0.05, n_waypoints=3, block=False)
+    def brake_tracking_input(self, send_hold: bool = True):
+        """Stop teleop input immediately and hold the latest commanded joints."""
+        self._sv_vel = [0.0, 0.0, 0.0]
+        self._stick_x_ema = 0.0
+        self._yaw_active = False
+        self._prev_hand_pos = None
+        self._last_raw_hand_pos = None
+        self._hand_filtered = None
+
+        q_hold = self._last_joint_cmd or self._ik_filter_pos or self._hold_q
+        if q_hold is None:
+            try:
+                q_hold = self._arm.GetArmJointMsgs().to_list()[:6]
+            except Exception:
+                q_hold = None
+        if q_hold is None:
+            return
+
+        q_hold = list(q_hold[:6])
+        self._ik_raw = list(q_hold)
+        self._ik_seed = list(q_hold)
+        self._ik_filter_pos = list(q_hold)
+        self._ik_filter_vel = [0.0] * 6
+        self._hold_q = list(q_hold)
+        self._joint_ma_window = []
+        self._last_sent_pose_tuple = None
+        if self._kin is not None:
+            try:
+                self._target_pose = self._kin.forward_kinematics(q_hold)
+            except Exception:
+                pass
+        if send_hold:
+            self._send_filtered()
+
+    def apply_base_yaw(self, angular_delta: float) -> bool:
+        """Apply joystick yaw as a direct base-joint target increment."""
+        if self.is_moving or self.is_estop:
+            return False
+        if self._ik_raw is not None:
+            q_target = list(self._ik_raw[:6])
+        elif self._ik_filter_pos is not None:
+            q_target = list(self._ik_filter_pos[:6])
+        else:
+            try:
+                q_target = self._arm.GetArmJointMsgs().to_list()[:6]
+            except Exception:
+                return False
+        if len(q_target) < 6:
+            return False
+        q_target[0] += angular_delta
+        self._ik_raw = q_target
+        self._ik_seed = list(q_target)
+        self._hold_q = list(q_target)
+        if self._kin is not None:
+            try:
+                self._target_pose = self._kin.forward_kinematics(q_target)
+                self._ref_robot_rpy = [
+                    self._target_pose.rx,
+                    self._target_pose.ry,
+                    self._target_pose.rz,
+                ]
+            except Exception:
+                pass
+        self._send_filtered()
+        return True
 
     def _send_joint_only(self):
         """Joint-space control: filter _ik_raw → send via JointCtrl, no MoveL/IK."""
@@ -1138,6 +1321,89 @@ class _ArmController:
 # ================================================================
 # Dual-Arm Pico Controller
 # ================================================================
+
+
+class _NoopGripperHold:
+    active = False
+    state = "idle"
+    target_angle = 0.0
+
+    def tick(self):
+        return None
+
+    def release(self):
+        return None
+
+
+class _NoopArm:
+    def ZeroTorqueMode(self, _enabled: bool) -> bool:
+        return True
+
+
+class _NoopArmController:
+    """Left-side placeholder used by single-arm right-hand mode."""
+
+    def __init__(self, name: str = "左臂"):
+        self.name = name
+        self._arm = _NoopArm()
+        self.is_moving = False
+        self.is_estop = False
+        self._gripper_hold = _NoopGripperHold()
+        self._gripper_angle = 0.0
+        self._payload_mode = False
+        self._tracking_engaged = False
+        self._grip_hold_start = None
+        self._kin = None
+        self._ik_raw = None
+        self._target_pose = None
+        self._stick_x_ema = 0.0
+        self._yaw_active = False
+        self._stick_conflict_warned = False
+
+    @property
+    def calibrated(self) -> bool:
+        return True
+
+    @property
+    def grip_active(self) -> bool:
+        return False
+
+    @property
+    def target_pose(self) -> Optional[ArmEndPose]:
+        return None
+
+    def init_position(self):
+        return None
+
+    def _send_filtered(self):
+        return None
+
+    def process_pose(self, _pose: Dict[str, Any], _speed_factor: float) -> bool:
+        return False
+
+    def move_to(self, _positions: List[float], _label: str):
+        return None
+
+    def emergency_stop(self):
+        self.is_estop = True
+
+    def recover_from_estop(self):
+        self.is_estop = False
+
+    def set_payload_mode(self, _enabled: bool):
+        return None
+
+    def _resync_ik(self):
+        return None
+
+    def get_joint_degrees(self) -> List[str]:
+        return []
+
+    def get_can_fps(self) -> float:
+        return 0.0
+
+    def get_can_stats(self):
+        return (0, 0, 0.0)
 
 
 def _export_robot_state(left: "_ArmController", right: "_ArmController", path: str) -> None:
@@ -1205,23 +1471,33 @@ class PicoArmController:
         max_angular_velocity: float = 1.5,
         position_scale: float = 1.0,
         deadzone: float = 0.03,
-        input_smoothing: float = 0.08,
-        filter_omega: float = 14.0,
+        input_smoothing: float = 0.65,
+        filter_omega: float = 24.0,
         max_ik_jump: float = 0.1,
-        yaw_scale: float = 0.5,
+        yaw_scale: float = 1.0,
+        joint_max_vel: float = 0.2,
+        grip_speed: float = 2.0,
         state_export_path: str | None = None,
+        single_arm: bool = False,
     ):
         self._rate = update_rate
+        self._single_arm = bool(single_arm)
+        self._grip_speed = float(grip_speed)
 
-        self._left = _ArmController(
-            "左臂", left_arm, update_rate, max_linear_velocity, max_angular_velocity,
-            position_scale, deadzone, input_smoothing, filter_omega, max_ik_jump,
-            yaw_scale=yaw_scale,
-        )
+        if self._single_arm:
+            self._left = _NoopArmController("左臂")
+        else:
+            self._left = _ArmController(
+                "左臂", left_arm, update_rate, max_linear_velocity, max_angular_velocity,
+                position_scale, deadzone, input_smoothing, filter_omega, max_ik_jump,
+                yaw_scale=yaw_scale,
+                joint_max_vel=joint_max_vel,
+            )
         self._right = _ArmController(
             "右臂", right_arm, update_rate, max_linear_velocity, max_angular_velocity,
             position_scale, deadzone, input_smoothing, filter_omega, max_ik_jump,
             yaw_scale=yaw_scale,
+            joint_max_vel=joint_max_vel,
         )
 
         # Shared state
@@ -1237,11 +1513,15 @@ class PicoArmController:
         # Button state for shared buttons
         self._prev_btn_left = [0] * 8
         self._prev_btn_right = [0] * 8
+        self._buttons_synced = False
 
         # Pose tracking
         self._last_pose_seq = -1
         self._pose_stale_count = 0
         self._max_stale_ticks = 30
+        self._duplicate_pose_count = 0
+        self._max_duplicate_ticks = max(6, int(update_rate * 0.12))
+        self._last_viewer_pos: Optional[List[float]] = None
 
         # State export for data recording
         self._state_export_path = state_export_path
@@ -1285,16 +1565,21 @@ class PicoArmController:
         self._running = False
 
     def _initialize(self):
-        logger.info("初始化左臂...")
-        self._left.init_position()
+        if not self._single_arm:
+            logger.info("初始化左臂...")
+            self._left.init_position()
         logger.info("初始化右臂...")
         self._right.init_position()
 
     def _print_banner(self):
         print("\n" + "=" * 58)
-        print("   EL-A3 Pico VR 双机械臂遥操作控制")
+        title = "EL-A3 Pico VR 单臂遥操作控制" if self._single_arm else "EL-A3 Pico VR 双机械臂遥操作控制"
+        print(f"   {title}")
         print("=" * 58)
-        print("  左手柄 → 左臂 (arm1)      右手柄 → 右臂 (arm2)")
+        if self._single_arm:
+            print("  右手柄 → 单机械臂")
+        else:
+            print("  左手柄 → 左臂 (arm1)      右手柄 → 右臂 (arm2)")
         print()
         print("  数据源:    pico3_webxr_pose_receiver.py")
         print()
@@ -1317,10 +1602,30 @@ class PicoArmController:
 
     def _log_speed(self):
         name, factor = SPEED_LEVELS[self._speed_idx]
-        lin_mm = self._left._max_lin_vel * factor * 1000
-        ang = self._left._max_ang_vel * factor
+        ref_arm = self._right if self._single_arm else self._left
+        lin_mm = ref_arm._max_lin_vel * factor * 1000
+        ang = ref_arm._max_ang_vel * factor
         print(f"  速度档位:  {self._speed_idx + 1}/5 [{name}] "
               f"({lin_mm:.0f}mm/s, {ang:.2f}rad/s)")
+
+    @staticmethod
+    def _arm_needs_stream(arm) -> bool:
+        return bool(
+            getattr(arm, "_tracking_engaged", False)
+            or getattr(arm, "_fine_yaw_mode", False)
+            or getattr(arm, "_yaw_active", False)
+            or getattr(arm, "_resync_cooldown", 0) > 0
+        )
+
+    def _send_active_streams(self):
+        for arm in (self._left, self._right):
+            if self._arm_needs_stream(arm):
+                arm._send_filtered()
+
+    def _brake_active_streams(self):
+        for arm in (self._left, self._right):
+            if self._arm_needs_stream(arm):
+                arm.brake_tracking_input(send_hold=True)
 
     # ---- Button helpers ----
 
@@ -1350,11 +1655,10 @@ class PicoArmController:
 
         if packet is None:
             self._pose_stale_count += 1
+            self._duplicate_pose_count = 0
             if self._pose_stale_count == 1:
                 logger.warning("未收到 Pico 数据，等待中...")
-            if self._pose_stale_count >= self._max_stale_ticks:
-                self._left._send_filtered()
-                self._right._send_filtered()
+            self._brake_active_streams()
             self._periodic_status()
             return
 
@@ -1362,11 +1666,15 @@ class PicoArmController:
         seq = packet.get("seq", -1)
         moving = self._left.is_moving or self._right.is_moving
         if seq == self._last_pose_seq:
+            self._duplicate_pose_count += 1
             if not moving:
-                self._left._send_filtered()
-                self._right._send_filtered()
+                if self._duplicate_pose_count >= self._max_duplicate_ticks:
+                    self._brake_active_streams()
+                else:
+                    self._send_active_streams()
             self._periodic_status()
             return
+        self._duplicate_pose_count = 0
         self._last_pose_seq = seq
 
         sources = packet.get("inputSources") or []
@@ -1385,17 +1693,25 @@ class PicoArmController:
         right_btns = _extract_buttons(right_src) if right_src else []
         left_axes = _extract_axes(left_src) if left_src else []
         right_axes = _extract_axes(right_src) if right_src else []
+        viewer_delta = None
+        viewer = packet.get("viewer") or {}
+        vpos = viewer.get("position") if isinstance(viewer, dict) else None
+        if isinstance(vpos, dict):
+            viewer_pos = [
+                float(vpos.get("x", 0.0)),
+                float(vpos.get("y", 0.0)),
+                float(vpos.get("z", 0.0)),
+            ]
+            if self._last_viewer_pos is not None:
+                viewer_delta = [viewer_pos[i] - self._last_viewer_pos[i] for i in range(3)]
+            else:
+                viewer_delta = [0.0, 0.0, 0.0]
+            self._last_viewer_pos = viewer_pos
 
-        # ---- Make controller poses headset-relative ----
-        viewer = packet.get("viewer", {})
-        if viewer:
-            vpos = viewer.get("position", {})
-            hx, hy, hz = vpos.get("x", 0), vpos.get("y", 0), vpos.get("z", 0)
-            for pose in (left_pose, right_pose):
-                if pose:
-                    pose["x"] -= hx
-                    pose["y"] -= hy
-                    pose["z"] -= hz
+        if self._single_arm:
+            left_pose = None
+            left_btns = []
+            left_axes = []
 
         # ---- Calibration ----
         l_need_cal = not self._left.calibrated and left_pose is not None and not self._left.is_moving
@@ -1421,6 +1737,12 @@ class PicoArmController:
                 _save(left_btns, self._prev_btn_left)
             if right_btns:
                 _save(right_btns, self._prev_btn_right)
+
+        if not self._buttons_synced:
+            _save_button_states()
+            self._buttons_synced = True
+            self._periodic_status()
+            return
 
         # ---- Button handling ----
         estop_active = self._left.is_estop or self._right.is_estop
@@ -1516,7 +1838,6 @@ class PicoArmController:
         # Active stick movement updates the gripper target; when the stick is
         # released, GripperHold re-sends the position command periodically so
         # the motor never times out, and monitors feedback for stall protection.
-        GRIP_SPEED = 1.0
         STICK_DEADZONE = 0.2
         GRIP_EFFORT = 0.65      # Nm torque limit while gripping
         GRIP_RELEASE_THRESH = 0.02  # rad — below this, gripper is "fully open"
@@ -1526,15 +1847,7 @@ class PicoArmController:
         ]:
             if self._zero_torque or arm.is_estop:
                 continue
-            # Skip gripper control while tracking is engaged
-            if arm._tracking_engaged:
-                continue
-            stick_y = 0.0
-            if len(axes) >= 4:
-                stick_y = axes[3]  # thumbstick Y
-            elif len(axes) >= 2:
-                stick_y = axes[1]  # fallback
-            stick_x_raw = axes[2] if len(axes) >= 3 else 0.0
+            stick_x_raw, stick_y = _thumbstick_axes(axes)
 
             stick_active = abs(stick_y) > STICK_DEADZONE and abs(stick_y) > abs(stick_x_raw)
 
@@ -1542,8 +1855,7 @@ class PicoArmController:
                 now = time.monotonic()
                 if now - arm._last_gripper_missing_log > 2.0:
                     arm._last_gripper_missing_log = now
-                    logger.warning("[%s] 电机7无反馈，跳过夹爪命令。请检查 L7 是否在线。", arm.name)
-                continue
+                    logger.warning("[%s] 电机7无反馈，仍发送夹爪命令；若实物不动请检查 L7 是否在线。", arm.name)
 
             if stick_active:
                 # --- active stick control: update target angle ---
@@ -1556,7 +1868,7 @@ class PicoArmController:
                         arm._gripper_last_sent = fb7.position
                         logger.info("[%s] 夹爪初始位置: %.3f rad", arm.name, fb7.position)
                     logger.info("[%s] 摇杆轴检测: axes=%s, stick_y=%.3f", arm.name, axes, stick_y)
-                speed = (-stick_y) * GRIP_SPEED
+                speed = (-stick_y) * self._grip_speed
                 force_send = False
                 if arm._gripper_hold.active and arm._gripper_hold.state == GripperHold.GRASPED:
                     arm._gripper_angle = arm._gripper_hold.target_angle
@@ -1676,15 +1988,28 @@ class PicoArmController:
                     arm._ik_filter_pos = list(cur_q)
                     arm._ik_filter_vel = [0.0] * 6
                     arm._hold_q = list(cur_q)
+                    arm._last_joint_cmd = list(cur_q)
+                    arm._sv_vel = [0.0, 0.0, 0.0]
+                    arm._joint_ma_window = []
+                    arm._consecutive_rejects = 0
+                    arm._consecutive_ik_fails = 0
+                    arm._resync_cooldown = 0
+                    if hasattr(arm._arm, "cancel_motion"):
+                        try:
+                            arm._arm.cancel_motion()
+                        except Exception:
+                            pass
                     arm_pose = left_pose if arm is self._left else right_pose
                     if arm_pose is not None:
                         hp = [arm_pose["x"], arm_pose["y"], arm_pose["z"]]
                         arm._prev_hand_pos = list(hp)
+                        arm._last_raw_hand_pos = list(hp)
+                        arm._hand_filtered = list(hp)
                         arm._ref_hand_rpy = list(quat_to_rpy(
                             (arm_pose["qx"], arm_pose["qy"],
                              arm_pose["qz"], arm_pose["qw"])))
-                    # Skip first 3 frames to avoid Pico data glitches on engagement
-                    arm._skip_frames = 3
+                    # Skip first frames to absorb Pico/WebXR pose settling on engagement.
+                    arm._skip_frames = 8
                     logger.info("[%s] Tracking ON", arm.name)
             elif not gp and gw:
                 arm._grip_hold_start = None
@@ -1699,8 +2024,7 @@ class PicoArmController:
 
         # ---- Pose processing (skip if zero-torque or estop) ----
         if self._zero_torque:
-            self._left._send_filtered()
-            self._right._send_filtered()
+            self._send_active_streams()
             self._periodic_status()
             return
         if self._left.is_moving or self._right.is_moving:
@@ -1718,7 +2042,10 @@ class PicoArmController:
                                  (self._right, right_pose, right_axes)]:
             if arm._ik_raw is None or arm._kin is None:
                 continue
-            stick_x_raw = axes[2] if len(axes) >= 3 else 0.0
+            if pose is None and (arm._tracking_engaged or arm._fine_yaw_mode):
+                arm.brake_tracking_input(send_hold=True)
+                continue
+            stick_x_raw, _stick_y = _thumbstick_axes(axes)
             # XBOX-style EMA: accelerated decay on release to prevent drag
             if abs(stick_x_raw) < 0.1:
                 decay = min(STICK_YAW_EMA * 3.0, 1.0)
@@ -1736,20 +2063,15 @@ class PicoArmController:
                 arm._yaw_active = True
                 ang_vel = -arm._stick_x_ema * arm._yaw_stick_scale * sf  # rad/s
                 angle = ang_vel * arm._dt
-                x, y = arm._target_pose.x, arm._target_pose.y
-                c, s = math.cos(angle), math.sin(angle)
-                arm._target_pose.x = x * c - y * s
-                arm._target_pose.y = x * s + y * c
-                arm._target_pose.rz += angle
-                arm._send_filtered()
+                arm.apply_base_yaw(angle)
             else:
                 # Reset conflict warning when stick released
                 arm._stick_conflict_warned = False
                 if yaw_off:
                     arm._yaw_active = False
                 # No stick → normal hand tracking
-                moved = arm.process_pose(pose, sf)
-                if not moved:
+                moved = arm.process_pose(pose, sf, viewer_delta=viewer_delta)
+                if not moved and self._arm_needs_stream(arm):
                     arm._send_filtered()
 
         self._periodic_status()
@@ -1764,7 +2086,8 @@ class PicoArmController:
         if ok_left and ok_right:
             self._zero_torque = new_state
             if new_state:
-                print(">>> 零力矩模式已开启: 可手动拖动双机械臂 <<<")
+                target = "机械臂" if self._single_arm else "双机械臂"
+                print(f">>> 零力矩模式已开启: 可手动拖动{target} <<<")
             else:
                 self._left._resync_ik()
                 self._right._resync_ik()
@@ -1775,7 +2098,8 @@ class PicoArmController:
     def _emergency_stop(self):
         self._left.emergency_stop()
         self._right.emergency_stop()
-        print("\n!!! 急停已执行 (双机械臂) — 按 Home 或零位恢复 !!!")
+        scope = "单臂" if self._single_arm else "双机械臂"
+        print(f"\n!!! 急停已执行 ({scope}) — 按 Home 或零位恢复 !!!")
 
     # ---- Diagnostics ----
 
@@ -1785,9 +2109,7 @@ class PicoArmController:
             return
         self._diag_tick = 0
 
-        l_deg = self._left.get_joint_degrees()
         r_deg = self._right.get_joint_degrees()
-        l_fps = self._left.get_can_fps()
 
         if self._zero_torque:
             mode = "零力矩"
@@ -1800,6 +2122,19 @@ class PicoArmController:
         else:
             mode = "正常"
 
+        if self._single_arm:
+            print(f"  [{mode}] 右臂(deg): [{', '.join(r_deg)}]")
+            r_fps = self._right.get_can_fps()
+            if r_fps > 0:
+                print(f"         CAN: {r_fps:.0f}fps")
+            else:
+                print("         [SIM mode]")
+            rp = self._right.target_pose
+            if rp:
+                print(f"  右臂末端: ({rp.x:.3f}, {rp.y:.3f}, {rp.z:.3f}) m")
+            return
+
+        l_deg = self._left.get_joint_degrees()
         print(f"  [{mode}] 左臂(deg): [{', '.join(l_deg)}]")
         print(f"         右臂(deg): [{', '.join(r_deg)}]")
         l_fps = self._left.get_can_fps()
@@ -1831,6 +2166,33 @@ def _check_can(args, can_name: str):
                   f"sudo ip link set {can_name} txqueuelen 128")
     except Exception:
         pass
+
+
+def _hold_current_position_after_enable(arm, label: str) -> bool:
+    """Immediately command the current joint pose after EnableArm."""
+    try:
+        joint_msg = arm.GetArmJointMsgs()
+        if getattr(joint_msg, "timestamp", 1.0) <= 0.0:
+            print(f"[WARNING] {label} 使能后没有有效关节反馈，暂时无法立即保持")
+            return False
+        q_now = joint_msg.to_list()[:6]
+    except Exception as exc:
+        print(f"[WARNING] {label} 使能后读取当前关节失败，暂时无法立即保持: {exc}")
+        return False
+    if len(q_now) < 6:
+        print(f"[WARNING] {label} 使能后关节反馈不足，暂时无法立即保持: {q_now}")
+        return False
+    torque_ff = None
+    if hasattr(arm, "ComputeGravityTorques"):
+        try:
+            torque_ff = arm.ComputeGravityTorques(q_now)
+        except Exception as exc:
+            print(f"[WARNING] {label} 使能后重力前馈计算失败，仅使用 PD 保持: {exc}")
+    ok = arm.JointCtrl(*q_now, velocities=[0.0] * 6, torque_ff=torque_ff)
+    if not ok:
+        print(f"[WARNING] {label} 使能后当前位置保持 JointCtrl 失败")
+        return False
+    return True
 
 
 def _warn_missing_wrist_or_gripper(arm, can_name: str, label: str) -> None:
@@ -1874,8 +2236,14 @@ def main():
                         help="最大线速度 m/s (默认: 0.15)")
     parser.add_argument("--max-ang-vel", type=float, default=1.5,
                         help="最大角速度 rad/s (默认: 1.5)")
-    parser.add_argument("--pos-scale", type=float, default=0.8,
-                        help="位置增量缩放 (默认: 0.5)")
+    parser.add_argument("--pos-scale", type=float, default=1.2,
+                        help="Pico 手柄位移到机械臂末端位移的比例 (默认: 1.2)")
+    parser.add_argument("--input-smoothing", type=float, default=0.65,
+                        help="Pico 输入低通系数，越大越跟手但噪声更多 (默认: 0.65)")
+    parser.add_argument("--filter-omega", type=float, default=24.0,
+                        help="关节二阶滤波响应频率，越大越跟手 (默认: 24)")
+    parser.add_argument("--max-ik-jump", type=float, default=0.2,
+                        help="IK 单步最大关节跳变保护 rad (默认: 0.2)")
     parser.add_argument("--kp", type=float, default=80.0,
                         help="位置增益 Kp (默认: 80，负载大时提到 120~150)")
     parser.add_argument("--kd", type=float, default=4.0,
@@ -1888,6 +2256,12 @@ def main():
                         help="调试模式")
     parser.add_argument("--state-export", default=None,
                         help="Export robot state to JSON file for data recording (e.g. /tmp/robot_latest_state.json)")
+    parser.add_argument("--joint-max-vel", type=float, default=1.2,
+                        help="JointCtrl 每关节最大追踪速度 rad/s (默认: 1.2，保守可试 0.6)")
+    parser.add_argument("--grip-speed", type=float, default=2.0,
+                        help="夹爪摇杆开合速度 rad/s (默认: 2.0)")
+    parser.add_argument("--yaw-scale", type=float, default=1.0,
+                        help="精细Yaw手柄角度到末端姿态角度比例 (默认: 1.0，想更细可设 0.5)")
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -1926,10 +2300,13 @@ def main():
             bus = arm.GetCanBusState()
             if bus not in ("ERROR-ACTIVE", "UNKNOWN"):
                 print(f"[WARNING] CAN bus state ({can_name}): {bus}")
-            arm.EnableArm()
-            time.sleep(0.3)
+            if not arm.EnableArm():
+                print(f"\nEnableArm failed on {can_name} ({label}); check CAN power/state before teleop")
+                arm.DisconnectPort()
+                return None
+            time.sleep(0.5)
             _warn_missing_wrist_or_gripper(arm, can_name, label)
-            arm.start_control_loop(rate_hz=500.0)
+            arm.start_control_loop(rate_hz=200.0)
             return arm
 
         left_arm = _connect(can_left, "left arm")
@@ -1970,7 +2347,14 @@ def main():
         max_angular_velocity=args.max_ang_vel,
         position_scale=args.pos_scale,
         deadzone=args.deadzone,
+        input_smoothing=args.input_smoothing,
+        filter_omega=args.filter_omega,
+        max_ik_jump=args.max_ik_jump,
+        yaw_scale=args.yaw_scale,
+        joint_max_vel=args.joint_max_vel,
+        grip_speed=args.grip_speed,
         state_export_path=args.state_export,
+        single_arm=single_arm,
     )
 
     ctrl_thread = threading.Thread(target=controller.start, daemon=True)
