@@ -276,7 +276,7 @@
     <parent link="l5_l6_urdf_asm"/>
     <child link="gripper_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="6.0" velocity="50" lower="-1.5708" upper="1.5708"/>
+    <limit effort="6.0" velocity="50" lower="-1.5708" upper="2.0"/>
     <dynamics damping="0.05" friction="0.05"/>
   </joint>
 
@@ -452,7 +452,7 @@
       <param name="zero_torque_kd_max">0.10</param>
       <command_interface name="position">
         <param name="min">-1.5708</param>
-        <param name="max">1.5708</param>
+        <param name="max">2.0</param>
       </command_interface>
       <command_interface name="velocity">
         <param name="min">-50.0</param>

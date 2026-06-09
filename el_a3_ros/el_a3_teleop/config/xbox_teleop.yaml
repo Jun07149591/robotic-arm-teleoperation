@@ -11,3 +11,9 @@ xbox_teleop_node:
     filter_omega: 14.0
     max_ik_jump: 0.5
     trajectory_time_from_start: 0.08
+    gripper_speed: 3.0
+    gripper_max_angle: 2.0
+    gripper_deadzone: 0.2
+    gripper_hold_interval: 0.25
+    gripper_close_effort: 0.65
+    gripper_hold_effort: 0.65

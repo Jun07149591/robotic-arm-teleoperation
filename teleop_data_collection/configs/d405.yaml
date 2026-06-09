@@ -1,0 +1,20 @@
+camera:
+  cameras:
+    - name: wrist
+      model: Intel RealSense D405
+      serial: "260322277792"
+      width: 640
+      height: 480
+      fps: 30
+      align_depth_to_color: true
+      depth_vis_max_m: 1.0
+      source_frame: wrist_color_optical_frame
+    - name: side
+      model: Intel RealSense D455
+      serial: "260722303162"
+      width: 640
+      height: 480
+      fps: 30
+      align_depth_to_color: true
+      depth_vis_max_m: 2.0
+      source_frame: side_color_optical_frame

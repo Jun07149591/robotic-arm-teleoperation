@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RealSense camera-to-robot extrinsic",
+  "type": "object",
+  "required": ["schema_version", "camera_model", "serial", "source_frame", "target_frame", "method", "matrix"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "camera_name": {"type": ["string", "null"]},
+    "camera_model": {"type": "string"},
+    "serial": {"type": "string"},
+    "source_frame": {"type": "string"},
+    "target_frame": {"type": "string"},
+    "method": {"type": "string"},
+    "frame_convention": {"type": ["string", "null"]},
+    "reference_object": {"type": ["string", "null"]},
+    "matrix": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
+    },
+    "xyz_m": {"type": "array", "items": {"type": "number"}},
+    "rpy_deg": {"type": "array", "items": {"type": "number"}},
+    "quaternion_xyzw": {"type": ["array", "null"], "items": {"type": "number"}},
+    "timestamp": {"type": "string"},
+    "num_samples": {"type": "integer"},
+    "sample_method": {"type": ["string", "null"]},
+    "calibration_error_m": {"type": ["number", "null"]},
+    "reprojection_error": {"type": ["number", "null"]},
+    "robot_frame": {"type": ["string", "null"]},
+    "camera_frame": {"type": ["string", "null"]},
+    "notes": {"type": ["string", "null"]}
+  }
+}

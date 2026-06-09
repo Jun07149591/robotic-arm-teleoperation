@@ -418,7 +418,7 @@ class StartupTestDemo(Node):
 
         ok = self._switch_controllers(
             activate=["zero_torque_controller"],
-            deactivate=["arm_controller"],
+            deactivate=["arm_controller", "gripper_controller"],
         )
         if ok:
             log_pass("arm_controller -> zero_torque_controller 切换成功")
@@ -438,7 +438,7 @@ class StartupTestDemo(Node):
             log_fail("zero_torque_controller 未激活")
 
         ok = self._switch_controllers(
-            activate=["arm_controller"],
+            activate=["arm_controller", "gripper_controller"],
             deactivate=["zero_torque_controller"],
         )
         if ok:

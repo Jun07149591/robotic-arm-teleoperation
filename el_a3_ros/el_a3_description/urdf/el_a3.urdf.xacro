@@ -286,7 +286,7 @@
     <parent link="l5_l6_urdf_asm"/>
     <child link="gripper_link"/>
     <axis xyz="0 0 1"/>
-    <limit effort="${wrist_effort}" velocity="50" lower="-1.5708" upper="1.5708"/>
+    <limit effort="${wrist_effort}" velocity="50" lower="-1.5708" upper="2.0"/>
     <dynamics damping="0.05" friction="0.05"/>
   </joint>
 

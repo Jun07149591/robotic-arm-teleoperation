@@ -78,7 +78,12 @@ xbox_teleop_node:
     filter_omega: 14.0           # 低通滤波截止频率
     max_ik_jump: 0.5             # IK 跳跃限制
     trajectory_time_from_start: 0.08  # 轨迹时间步长 (s)
+    gripper_speed: 3.0           # 夹爪开合速度 (rad/s)
+    gripper_close_effort: 0.65   # 夹取时 L7 力矩上限 (Nm)
+    gripper_hold_effort: 0.65    # 松开后保持力矩上限 (Nm)
 ```
+
+夹爪命令会发送位置轨迹，并额外通过 `/gripper_controller/torque_limit` 发布力矩上限。硬件层会把该值映射为 L7 电机 `LIMIT_TORQUE`，用于参考 PICO 遥操作的夹持保持方式；如果夹不住，优先小幅提高 `gripper_close_effort` 和 `gripper_hold_effort`。
 
 ## 调试
 

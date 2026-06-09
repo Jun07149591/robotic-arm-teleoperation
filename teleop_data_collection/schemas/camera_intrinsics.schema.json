@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RealSense camera intrinsics",
+  "type": "object",
+  "required": ["schema_version", "camera_model", "serial", "stream", "intrinsics", "depth_scale"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "camera_name": {"type": ["string", "null"]},
+    "camera_model": {"type": "string"},
+    "serial": {"type": "string"},
+    "firmware_version": {"type": ["string", "null"]},
+    "product_line": {"type": ["string", "null"]},
+    "physical_port": {"type": ["string", "null"]},
+    "usb_type": {"type": ["string", "null"]},
+    "sensor_info": {"type": ["object", "null"]},
+    "stream": {"type": "object"},
+    "intrinsics": {"type": "object"},
+    "depth_scale": {"type": "number"},
+    "timestamp": {"type": "string"},
+    "calibration_state": {"type": ["string", "null"]},
+    "depth_alignment": {"type": ["string", "null"]},
+    "source_frame": {"type": ["string", "null"]}
+  }
+}

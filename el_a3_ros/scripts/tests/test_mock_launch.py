@@ -182,6 +182,13 @@ def switch_controllers(activate, deactivate):
 def send_trajectory(controller, joint_names, positions, duration_sec=2):
     """通过 ros2 topic pub 发送轨迹"""
     positions_str = str(positions)
+    if controller == "gripper_controller":
+        torque = 0.65 if positions[0] > 0.03 else 0.0
+        torque_cmd = (
+            f"ros2 topic pub --once /{controller}/torque_limit "
+            f'std_msgs/msg/Float64 "{{data: {torque}}}"'
+        )
+        run_cmd(torque_cmd, timeout=5)
     cmd = (
         f'ros2 topic pub --once /{controller}/joint_trajectory '
         f'trajectory_msgs/msg/JointTrajectory '
@@ -242,7 +249,7 @@ def test_a33_controller_switch():
 
     load_controller("zero_torque_controller")
 
-    if switch_controllers(["zero_torque_controller"], ["arm_controller"]):
+    if switch_controllers(["zero_torque_controller"], ["arm_controller", "gripper_controller"]):
         log_pass("arm_controller -> zero_torque_controller 切换成功")
     else:
         log_fail("arm_controller -> zero_torque_controller 切换失败")
@@ -261,7 +268,7 @@ def test_a33_controller_switch():
     else:
         log_fail("zero_torque_controller 未激活")
 
-    if switch_controllers(["arm_controller"], ["zero_torque_controller"]):
+    if switch_controllers(["arm_controller", "gripper_controller"], ["zero_torque_controller"]):
         log_pass("zero_torque_controller -> arm_controller 切换成功")
     else:
         log_fail("zero_torque_controller -> arm_controller 切换失败")

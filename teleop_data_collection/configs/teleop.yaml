@@ -1,0 +1,15 @@
+teleop:
+  controller: el_a3_sdk/demo/pico_control_jointctrl.py
+  pose_file: /tmp/pico_latest_pose.json
+  update_rate_hz: 100.0
+  max_linear_velocity: 0.15
+  max_angular_velocity: 1.5
+  position_scale: 1.2
+  deadzone: 0.02
+  input_smoothing: 0.65
+  filter_omega: 24.0
+  max_ik_jump: 0.2
+  joint_max_vel: 1.2
+  grip_speed: 2.0
+  yaw_scale: 1.0
+  state_export: /tmp/robot_latest_state.json

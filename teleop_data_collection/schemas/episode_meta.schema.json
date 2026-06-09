@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "teleop_vla episode meta",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "episode_id",
+    "task_text",
+    "success",
+    "robot",
+    "camera",
+    "timing"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "episode_id": {"type": "string"},
+    "dataset_name": {"type": ["string", "null"]},
+    "dataset_version": {"type": ["string", "null"]},
+    "episode_index": {"type": ["integer", "null"]},
+    "task_text": {"type": "string"},
+    "task_category": {"type": ["string", "null"]},
+    "task_id": {"type": ["string", "null"]},
+    "operator": {"type": ["string", "null"]},
+    "operator_id": {"type": ["string", "null"]},
+    "session_id": {"type": ["string", "null"]},
+    "workspace_id": {"type": ["string", "null"]},
+    "scene_id": {"type": ["string", "null"]},
+    "success": {"type": ["boolean", "null"]},
+    "failure_reason": {"type": ["string", "null"]},
+    "termination_reason": {"type": ["string", "null"]},
+    "notes": {"type": ["string", "null"]},
+    "robot": {"type": "object"},
+    "camera": {"type": "object"},
+    "cameras": {"type": ["array", "null"], "items": {"type": "object"}},
+    "extrinsics": {"type": "object"},
+    "streams": {"type": "object"},
+    "timing": {"type": "object"},
+    "code": {"type": "object"},
+    "environment": {"type": "object"},
+    "quality": {"type": "object"},
+    "labels": {"type": "object"}
+  }
+}

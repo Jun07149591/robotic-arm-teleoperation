@@ -41,7 +41,12 @@
           <param name="zero_torque_kd_max">0.15</param>   <!-- Kd at rest (stability) -->
           <param name="kd_velocity_ref">1.0</param>        <!-- Reference velocity where Kd drops to midpoint (rad/s) -->
           <param name="kd_smoothing_alpha">0.15</param>    <!-- EMA smoothing factor (smaller = smoother transitions) -->
-          
+
+          <!-- Gripper torque-limit hold (matches SDK/PICO GripperCtrl(gripper_effort=...)) -->
+          <param name="gripper_default_torque_limit">0.65</param>
+          <param name="gripper_torque_limit_epsilon">0.01</param>
+          <param name="gripper_hold_torque_ff">0.0</param>
+
           <!-- Pinocchio dynamics model configuration -->
           <param name="urdf_path">$(find el_a3_description)/urdf/el_a3.urdf</param>
           <param name="use_pinocchio_gravity">true</param>  <!-- Enable full dynamics gravity compensation -->
@@ -254,7 +259,7 @@
         <param name="zero_torque_kd_max">0.10</param>
         <command_interface name="position">
           <param name="min">-1.5708</param>
-          <param name="max">1.5708</param>
+          <param name="max">2.0</param>
         </command_interface>
         <command_interface name="velocity">
           <param name="min">-50.0</param>

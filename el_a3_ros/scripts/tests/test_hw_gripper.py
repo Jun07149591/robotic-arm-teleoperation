@@ -46,6 +46,13 @@ def run_cmd(cmd, timeout=15):
 
 
 def send_gripper_position(target):
+    torque = 0.65 if target > 0.03 else 0.0
+    torque_cmd = (
+        f"ros2 topic pub --once /{GRIPPER_CONTROLLER}/torque_limit "
+        f'std_msgs/msg/Float64 "{{data: {torque}}}"'
+    )
+    run_cmd(torque_cmd, timeout=5)
+
     cmd = (
         f'ros2 topic pub --once /{GRIPPER_CONTROLLER}/joint_trajectory '
         f'trajectory_msgs/msg/JointTrajectory '

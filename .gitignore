@@ -98,3 +98,19 @@ hardware/3mf/
 .vscode/
 .idea/
 .DS_Store
+
+# Local datasets / collected episodes
+teleop_data_collection/datasets/
+teleop_data_collection/calibrations/
+*.mp4
+*.avi
+*.bag
+*.db3
+*.jsonl
+*.zip
+*.tar
+*.tar.gz
+*.pth
+*.pt
+*.onnx
+.agent/

@@ -10,6 +10,8 @@ and profile-aware axis/button mapping.
 """
 
 import math
+import os
+import sys
 import threading
 import time
 from typing import List, Optional, Tuple
@@ -21,6 +23,14 @@ from sensor_msgs.msg import Joy, JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from controller_manager_msgs.srv import SwitchController
 from builtin_interfaces.msg import Duration
+from std_msgs.msg import Float64
+
+# Ensure el_a3_sdk is importable when running from an uninstalled source tree.
+_sdk_dir = os.path.realpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "el_a3_sdk")
+)
+if os.path.isdir(os.path.join(_sdk_dir, "el_a3_sdk")) and _sdk_dir not in sys.path:
+    sys.path.insert(0, _sdk_dir)
 
 from el_a3_sdk.controller_profiles import (
     ControllerProfile,
@@ -30,6 +40,8 @@ from el_a3_sdk.controller_profiles import (
 )
 from el_a3_sdk.kinematics import ELA3Kinematics
 from el_a3_sdk.data_types import ArmEndPose
+
+from .gripper_control import XboxGripperVelocityControl
 
 
 ARM_JOINTS = [
@@ -67,6 +79,12 @@ class XboxTeleopNode(Node):
         self.declare_parameter("filter_omega", 14.0)
         self.declare_parameter("max_ik_jump", 0.5)
         self.declare_parameter("trajectory_time_from_start", 0.08)
+        self.declare_parameter("gripper_speed", 3.0)
+        self.declare_parameter("gripper_max_angle", 2.0)
+        self.declare_parameter("gripper_deadzone", 0.2)
+        self.declare_parameter("gripper_hold_interval", 0.25)
+        self.declare_parameter("gripper_close_effort", 0.65)
+        self.declare_parameter("gripper_hold_effort", 0.65)
 
         profile_id = str(self.get_parameter("controller_profile").value).strip()
         self._controller_name = str(self.get_parameter("controller_name").value).strip()
@@ -78,6 +96,12 @@ class XboxTeleopNode(Node):
         self._filter_omega = float(self.get_parameter("filter_omega").value)
         self._max_ik_jump = float(self.get_parameter("max_ik_jump").value)
         self._traj_dt = float(self.get_parameter("trajectory_time_from_start").value)
+        self._gripper_speed = float(self.get_parameter("gripper_speed").value)
+        self._gripper_max_angle = float(self.get_parameter("gripper_max_angle").value)
+        self._gripper_deadzone = float(self.get_parameter("gripper_deadzone").value)
+        self._gripper_hold_interval = float(self.get_parameter("gripper_hold_interval").value)
+        self._gripper_close_effort = float(self.get_parameter("gripper_close_effort").value)
+        self._gripper_hold_effort = float(self.get_parameter("gripper_hold_effort").value)
 
         # --- Resolve profile ---
         if profile_id in PROFILES:
@@ -107,6 +131,8 @@ class XboxTeleopNode(Node):
             JointTrajectory, "/arm_controller/joint_trajectory", 10)
         self._gripper_pub = self.create_publisher(
             JointTrajectory, "/gripper_controller/joint_trajectory", 10)
+        self._gripper_torque_pub = self.create_publisher(
+            Float64, "/gripper_controller/torque_limit", 10)
 
         self._joy_sub = self.create_subscription(
             Joy, "/joy", self._joy_callback, 10, callback_group=cb_group)
@@ -138,8 +164,14 @@ class XboxTeleopNode(Node):
         self._seed_just_init = False
         self._sv = [0.0] * 6
 
-        self._gripper_angle = 0.0
-        self._gripper_step = 0.2
+        self._gripper = XboxGripperVelocityControl(
+            max_angle=self._gripper_max_angle,
+            speed=self._gripper_speed,
+            deadzone=self._gripper_deadzone,
+            hold_interval=self._gripper_hold_interval,
+            close_effort=self._gripper_close_effort,
+            hold_effort=self._gripper_hold_effort,
+        )
 
         self._current_q: Optional[List[float]] = None
         self._joint_state_received = False
@@ -151,8 +183,6 @@ class XboxTeleopNode(Node):
         self._joy_axes: List[float] = [0.0] * 8
         self._joy_buttons: List[int] = [0] * 16
         self._prev_buttons: List[int] = [0] * 16
-        self._prev_dpad_up = 0
-        self._prev_dpad_down = 0
         self._joy_updated = False
         self._initialized = False
 
@@ -180,6 +210,12 @@ class XboxTeleopNode(Node):
                 idx = list(msg.name).index(name)
                 q[i] = msg.position[idx]
                 found += 1
+        if GRIPPER_JOINT in msg.name:
+            idx = list(msg.name).index(GRIPPER_JOINT)
+            if idx < len(msg.position) and self._gripper.sync_feedback_angle(msg.position[idx]):
+                self.get_logger().info(
+                    f"夹爪初始位置同步: {self._gripper.angle:.3f} rad"
+                )
         if found == 6:
             self._current_q = q
             self._q_buffer.append(list(q))
@@ -264,20 +300,19 @@ class XboxTeleopNode(Node):
         if self._btn_edge(buttons.start):
             self.get_logger().info("收到退出请求 (Start)")
 
-        # D-pad gripper
+        # D-pad gripper: velocity control + periodic hold, matching Pico teleop.
         dpad_y = self._axis_value(sticks.dpad_y)
-        dpad_up = 1 if dpad_y < -0.5 else 0
-        dpad_down = 1 if dpad_y > 0.5 else 0
-        if dpad_up and not self._prev_dpad_up:
-            self._gripper_angle = min(self._gripper_angle + self._gripper_step, 1.5708)
-            self._send_gripper(self._gripper_angle)
-            self.get_logger().info(f"夹爪: {self._gripper_angle:.2f} rad")
-        if dpad_down and not self._prev_dpad_down:
-            self._gripper_angle = max(self._gripper_angle - self._gripper_step, -1.5708)
-            self._send_gripper(self._gripper_angle)
-            self.get_logger().info(f"夹爪: {self._gripper_angle:.2f} rad")
-        self._prev_dpad_up = dpad_up
-        self._prev_dpad_down = dpad_down
+        gripper_cmd = self._gripper.update(
+            dpad_y=dpad_y,
+            dt=self._dt,
+            now=time.monotonic(),
+        )
+        if gripper_cmd is not None:
+            self._send_gripper(gripper_cmd.angle, gripper_cmd.effort)
+            self.get_logger().debug(
+                f"夹爪: dpad_y={dpad_y:.3f} angle={gripper_cmd.angle:.3f} rad "
+                f"effort={gripper_cmd.effort:.2f} Nm"
+            )
 
         self._prev_buttons = list(self._joy_buttons)
 
@@ -494,7 +529,11 @@ class XboxTeleopNode(Node):
         msg.points = [pt]
         self._arm_pub.publish(msg)
 
-    def _send_gripper(self, angle: float) -> None:
+    def _send_gripper(self, angle: float, effort: float = 0.0) -> None:
+        torque_msg = Float64()
+        torque_msg.data = float(effort)
+        self._gripper_torque_pub.publish(torque_msg)
+
         msg = JointTrajectory()
         msg.joint_names = [GRIPPER_JOINT]
         pt = JointTrajectoryPoint()
@@ -571,11 +610,11 @@ class XboxTeleopNode(Node):
     def _switch_to_zero_torque_controller(self) -> None:
         self._call_switch_controller(
             activate=["zero_torque_controller"],
-            deactivate=["arm_controller"])
+            deactivate=["arm_controller", "gripper_controller"])
 
     def _switch_to_trajectory_controller(self) -> None:
         self._call_switch_controller(
-            activate=["arm_controller"],
+            activate=["arm_controller", "gripper_controller"],
             deactivate=["zero_torque_controller"])
 
     def _call_switch_controller(

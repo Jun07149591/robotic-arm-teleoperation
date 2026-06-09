@@ -34,6 +34,7 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from controller_manager_msgs.srv import SwitchController
 from builtin_interfaces.msg import Duration
+from std_msgs.msg import Float64
 
 from el_a3_sdk.kinematics import ELA3Kinematics
 from el_a3_sdk.data_types import ArmEndPose
@@ -165,6 +166,8 @@ class PicoTeleopNode(Node):
         _gripper_topic = str(self.get_parameter("gripper_controller_topic").value)
         self._arm_pub = self.create_publisher(JointTrajectory, _arm_topic, 10)
         self._gripper_pub = self.create_publisher(JointTrajectory, _gripper_topic, 10)
+        self._gripper_torque_pub = self.create_publisher(
+            Float64, "/gripper_controller/torque_limit", 10)
         self._js_sub = self.create_subscription(
             JointState, "/joint_states", self._joint_state_callback, 10,
             callback_group=cb_group)
@@ -861,6 +864,10 @@ class PicoTeleopNode(Node):
             pt.positions = [self._gripper_angle]
         elif angle is not None:
             pt.positions = [angle]
+        if pt.positions:
+            torque_msg = Float64()
+            torque_msg.data = 0.65 if pt.positions[0] > 0.03 else 0.0
+            self._gripper_torque_pub.publish(torque_msg)
         pt.time_from_start = Duration(sec=0, nanosec=200_000_000)
         msg.points = [pt]
         self._gripper_pub.publish(msg)

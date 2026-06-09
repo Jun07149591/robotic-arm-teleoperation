@@ -1,0 +1,16 @@
+robot:
+  model: AE/EL-A3
+  control_mode: sdk_pico_teleop
+  can_interface: can0
+  default_kp: 80.0
+  default_kd: 4.0
+  gravity_feedforward_ratio: 1.0
+  control_loop_hz: 500.0
+  joint_names:
+    - L1_joint
+    - L2_joint
+    - L3_joint
+    - L4_joint
+    - L5_joint
+    - L6_joint
+    - L7_joint

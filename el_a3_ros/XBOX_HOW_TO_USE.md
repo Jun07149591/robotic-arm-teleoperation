@@ -71,6 +71,18 @@ ros2 launch el_a3_teleop real_xbox_teleop.launch.py can_interface:=can0 use_rviz
 |------|------|
 | A | 切换速度档位（5 档循环） |
 | B | 回 Home 位置 |
+| X | 回零位 |
+| Y | 零力矩模式 |
+| Back | 急停 |
+
+### 夹爪控制
+
+| 输入 | 功能 |
+|------|------|
+| D-pad 上 | 按住连续收紧夹爪 |
+| D-pad 下 | 按住连续打开夹爪 |
+
+夹爪控制现在和 PICO 遥操作一致：按住 D-pad 时按速度连续改变目标角，并通过 `/gripper_controller/torque_limit` 发送力矩上限；松开后如果夹爪仍处于闭合状态，会周期性重发当前位置和保持力矩上限。硬件层会把该值映射为 L7 电机 `LIMIT_TORQUE`，所以不是只靠位置命令硬顶。
 
 ## 当前配置参数
 
@@ -84,6 +96,14 @@ ros2 launch el_a3_teleop real_xbox_teleop.launch.py can_interface:=can0 use_rviz
 | `deadzone` | 0.15 | 摇杆死区 |
 | `input_smoothing` | 0.35 | EMA 平滑系数 |
 | `trajectory_time_from_start` | 0.08 s | 轨迹时间步长 |
+| `gripper_speed` | 3.0 rad/s | 夹爪开合速度 |
+| `gripper_max_angle` | 2.0 rad | 夹爪最大闭合目标 |
+| `gripper_deadzone` | 0.2 | D-pad 输入死区 |
+| `gripper_hold_interval` | 0.25 s | 松开后夹爪保持命令重发间隔 |
+| `gripper_close_effort` | 0.65 Nm | 闭合/夹取时的夹爪力矩上限 |
+| `gripper_hold_effort` | 0.65 Nm | 松开 D-pad 后的保持力矩上限 |
+
+如果夹不住物体，先把 `gripper_close_effort` 和 `gripper_hold_effort` 从 `0.65` 小幅提高到 `0.8` 或 `1.0` 测试；不要长时间大力保持。若需要长时间夹住轻物体，可以把 `gripper_hold_effort` 降到 `0.16` 左右减小发热。硬件层还有 `gripper_default_torque_limit` 和 `gripper_hold_torque_ff` 参数，可通过 `/el_a3_hw_debug` 动态调整。
 
 ## 无手柄时的替代操作
 

@@ -7,6 +7,7 @@ and injects the resolved profile into the teleop node.
 """
 
 import os
+import sys
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -43,8 +44,38 @@ def _find_fastrtps_xml() -> str:
     return candidate  # return best guess even if not found
 
 
+def _find_sdk_path() -> str:
+    """Locate the sibling el_a3_sdk package from source or install paths."""
+    here = os.path.realpath(__file__)
+    for levels in range(3, 8):
+        d = here
+        for _ in range(levels):
+            d = os.path.dirname(d)
+        candidate = os.path.join(d, "el_a3_sdk")
+        if os.path.isdir(os.path.join(candidate, "el_a3_sdk")):
+            return candidate
+        sibling = os.path.join(os.path.dirname(d), "el_a3_sdk")
+        if os.path.isdir(os.path.join(sibling, "el_a3_sdk")):
+            return sibling
+    return os.path.realpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "el_a3_sdk")
+    )
+
+
+def _pythonpath_with_sdk() -> str:
+    sdk_path = _find_sdk_path()
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in pythonpath.split(os.pathsep) if p]
+    if sdk_path not in parts:
+        parts.append(sdk_path)
+    return os.pathsep.join(parts)
+
+
 def _create_input_nodes(context, *_args, **_kwargs):
     """OpaqueFunction: auto-detect controller and construct joy + teleop nodes."""
+    sdk_path = _find_sdk_path()
+    if sdk_path not in sys.path:
+        sys.path.insert(0, sdk_path)
     from el_a3_sdk.controller_profiles import detect_controller
 
     auto_detect = context.launch_configurations.get("auto_detect_controller", "true")
@@ -154,6 +185,7 @@ def generate_launch_description():
                 "FASTRTPS_DEFAULT_PROFILES_FILE",
                 _find_fastrtps_xml(),
             ),
+            SetEnvironmentVariable("PYTHONPATH", _pythonpath_with_sdk()),
             el_a3_control_launch,
             OpaqueFunction(function=_create_input_nodes),
         ]

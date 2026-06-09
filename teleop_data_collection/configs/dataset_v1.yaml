@@ -1,0 +1,31 @@
+dataset:
+  name: teleop_vla
+  schema_version: teleop_vla_v1
+  output_root: teleop_data_collection/datasets
+  raw_camera_fps: 30
+  step_sample_rate_hz: 15
+  save_raw_streams: true        # JSONL metadata logs
+  save_raw_images: false        # per-step PNGs; enable only for camera/debug checks
+  save_rgb_quality: 95
+  save_depth_png: false
+
+camera:
+  cameras:
+    - name: wrist
+      model: Intel RealSense D405
+      serial: "260322277792"
+      width: 640
+      height: 480
+      fps: 30
+      align_depth_to_color: true
+      depth_vis_max_m: 1.0
+      source_frame: wrist_color_optical_frame
+    - name: side
+      model: Intel RealSense D455
+      serial: "260722303162"
+      width: 640
+      height: 480
+      fps: 30
+      align_depth_to_color: true
+      depth_vis_max_m: 2.0
+      source_frame: side_color_optical_frame

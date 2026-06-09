@@ -141,7 +141,15 @@ python3 el_a3_sdk/demo/pico_control_jointctrl.py --sim
 
 ## 9. 数据采集（训练 VLA 用）
 
-遥操作的同时录制训练数据，输出 **LeRobot v3.0** 兼容格式（Parquet + MP4）。
+遥操作的同时录制训练数据，输出 **LeRobot v3.0** 兼容格式（Parquet + MP4）。现在支持两种控制器采集：
+
+- PICO：写入 `observation.pico`
+- XBOX：写入 `observation.xbox`
+
+两种 controller feature 不混在同一个数据集里，建议分别使用不同 `--repo-id`。
+`--fps` 必须和采样 `--hz` 一致；例如 `--hz 15 --fps 15`，这样 parquet 每一行和 MP4 每一帧共享同一时间基。
+
+### 9.1 PICO 采集
 
 **做完任务 → 长按 A 失能 → 自动保存**，全程不碰键盘：
 
@@ -156,14 +164,124 @@ python teleop_data_collection/scripts/record_sdk_episode.py \
   --state-file /tmp/robot_latest_state.json \
   --repo-id my_dataset \
   --task "pick up the object" \
-  --hz 15 --fps 30 --max-duration 60
+  --hz 15 --fps 15 --max-duration 60
 ```
 
 | 终止方式 | 触发 | success |
 |---------|------|---------|
 | 长按 A (右手) | 机械臂失能 | ✅ 自动 |
+| 按 `q` | 采集终端或预览窗口 | ✅ 自动 |
+| 按 `f` | 采集终端 | ❌ 保存为失败 |
+| 预览窗口按 `Esc` | 仅 `--preview` 时 | ✅ 自动 |
 | `--max-duration N` | 超时兜底 | ❌ |
 | Ctrl+C | 手动 | ❌ |
 
-详见 [`teleop_data_collection/README.md`](teleop_data_collection/README.md)。
+默认 `q` 会保存当前 episode 为成功，`f` 会保存当前 episode 为失败；可以用 `--keyboard-stop-key e` / `--keyboard-fail-key x` 改成其它单键，或用空字符串禁用。
 
+### 9.2 XBOX 采集
+
+XBOX 采集使用 ROS2 XBOX 遥操作控制机械臂，另开一个 exporter 把 `/joint_states` 和 `/joy` 导出成采集脚本可读的 JSON。采集脚本仍然是纯观察者，只读相机和文件，不直接控制机械臂。`--profile auto` 会按 `/dev/input/js0` 自动识别手柄映射；Zikway HID 这类手柄会使用 Start=11，而标准 Xbox 使用 Start=7。
+
+一次完整 XBOX 采集：
+
+```text
+real_xbox_teleop.launch.py
+  -> /joint_states + /joy
+  -> export_ros_xbox_state.py
+  -> /tmp/robot_latest_state.json + /tmp/xbox_latest_input.json
+  -> record_xbox_episode.py
+  -> LeRobot v3.0 数据集
+```
+
+```bash
+# 终端 1：启动 ROS2 XBOX 实机遥操作
+cd el_a3_ros
+sudo bash scripts/setup_can.sh can0 1000000
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch el_a3_teleop real_xbox_teleop.launch.py can_interface:=can0
+
+# 终端 2：导出 ROS2 机器人状态和 XBOX 输入
+cd /home/jun/library_robot/EDULITE_A3
+source /opt/ros/humble/setup.bash
+/usr/bin/python3 teleop_data_collection/scripts/export_ros_xbox_state.py \
+  --state-file /tmp/robot_latest_state.json \
+  --gamepad-file /tmp/xbox_latest_input.json \
+  --profile auto \
+  --device /dev/input/js0
+
+# 终端 3：采集 XBOX episode
+python teleop_data_collection/scripts/record_xbox_episode.py \
+  --state-file /tmp/robot_latest_state.json \
+  --gamepad-file /tmp/xbox_latest_input.json \
+  --repo-id my_edulite_xbox_dataset \
+  --task "pick up the object" \
+  --hz 15 \
+  --fps 15 \
+  --max-duration 60 \
+  --preview
+```
+
+连续采集多条 episode 时，在终端 3 加 `--continuous`。每次长按 `Start` 会保存当前 episode，松开 `Start` 后自动进入下一条；`Ctrl+C` 退出连续采集。
+
+```bash
+python teleop_data_collection/scripts/record_xbox_episode.py \
+  --state-file /tmp/robot_latest_state.json \
+  --gamepad-file /tmp/xbox_latest_input.json \
+  --repo-id my_edulite_xbox_dataset \
+  --task "pick up the object" \
+  --hz 15 \
+  --fps 15 \
+  --max-duration 60 \
+  --preview \
+  --continuous
+```
+
+如果只想连续采固定数量，可以加：
+
+```bash
+--continuous --max-episodes 20
+```
+
+XBOX 结束方式：
+
+| 终止方式 | 触发 | success |
+|---------|------|---------|
+| 长按 Start 1 秒 | exporter 写 `episode_done=true` | ✅ 自动 |
+| 按 `q` | 采集终端或预览窗口 | ✅ 自动，并停止 `--continuous` |
+| 按 `f` | 采集终端 | ❌ 保存为失败，`--continuous` 下继续下一条 |
+| 预览窗口按 `Esc` | 仅 `--preview` 时 | ✅ 自动，并停止 `--continuous` |
+| `--max-duration N` | 超时兜底 | ❌ |
+| Ctrl+C | 手动 | ❌ |
+
+默认 `q` 会保存当前 episode 为成功并结束整个采集会话；`f` 会保存当前 episode 为失败，连续采集时继续进入下一条。可以用 `--keyboard-stop-key e` / `--keyboard-fail-key x` 改成其它单键，或用空字符串禁用。
+
+XBOX/PICO 的 LeRobot episode 数量以 `meta/info.json` 的 `total_episodes`、`data/chunk-*/*.parquet` 和 `videos/*/chunk-*/*.mp4` 为准。根目录下的 `episode_000xxx/` 只是 raw 调试日志；异常中断可能留下空目录，不能用最大 raw 序号判断视频数量。若追加时提示下一条 raw 目录已存在，说明旧 repo 的 raw 目录和 LeRobot 数据已经错位，建议换新的 `--repo-id` 重新采。
+
+XBOX LeRobot controller feature 为 `observation.xbox`，shape 为 `(20,)`：
+
+```text
+lx, ly, rx, ry, lt, rt, dpad_x, dpad_y,
+btn_a, btn_b, btn_x, btn_y, btn_lb, btn_rb,
+btn_back, btn_start, valid, speed_level, mode_normal, episode_done
+```
+
+XBOX 常用按键：
+
+| 输入 | 功能 |
+|------|------|
+| 左摇杆 | 末端 X/Y 平移 |
+| LT / RT | 末端 Z 下/上 |
+| 右摇杆 | 姿态 Yaw/Pitch |
+| LB / RB | Roll |
+| D-pad 上/下 | 按住连续收紧/打开夹爪，松开后带夹持力保持 |
+| A | 切换速度档 |
+| B | 回 Home |
+| X | 回零位 |
+| Y | 零力矩模式 |
+| Back | 急停 |
+| Start 长按 | 结束当前 episode |
+
+XBOX 夹爪已按 PICO 遥操作方式增加夹持力保持：闭合时发送目标角，并通过 `/gripper_controller/torque_limit` 发布 `gripper_close_effort`；松开后周期性重发目标角和 `gripper_hold_effort`。ROS 硬件层会把该 torque limit 映射为 L7 电机 `LIMIT_TORQUE`，用于提升夹持保持力；如果仍夹不住，优先小幅提高 `el_a3_ros/el_a3_teleop/config/xbox_teleop.yaml` 里的 `gripper_close_effort` 和 `gripper_hold_effort`。
+
+详见 [`teleop_data_collection/README.md`](teleop_data_collection/README.md)。

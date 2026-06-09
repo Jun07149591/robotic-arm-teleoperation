@@ -11,6 +11,7 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <string>
 #include <time.h>
 #include <vector>
 
@@ -21,6 +22,11 @@
 namespace el_a3_hardware
 {
 
+namespace
+{
+constexpr uint16_t PARAM_LIMIT_TORQUE = 0x700B;
+}  // namespace
+
 RsA3HardwareInterface::RsA3HardwareInterface()
   : can_interface_("can0")
   , host_can_id_(0xFD)
@@ -29,8 +35,10 @@ RsA3HardwareInterface::RsA3HardwareInterface()
   , velocity_limit_(10.0)
   , control_mode_(ControlMode::POSITION)
   , use_mock_hardware_(false)
-  
   , zero_torque_kd_(1.0)
+  , gripper_default_torque_limit_(0.65)
+  , gripper_torque_limit_epsilon_(0.01)
+  , gripper_hold_torque_ff_(0.0)
   , gravity_comp_enabled_(false)
   , gravity_feedforward_ratio_(1.0)
   , use_pinocchio_gravity_(false)
@@ -73,6 +81,15 @@ hardware_interface::CallbackReturn RsA3HardwareInterface::on_init(
   if (info_.hardware_parameters.count("velocity_limit")) {
     velocity_limit_ = std::stod(info_.hardware_parameters.at("velocity_limit"));
   }
+  if (info_.hardware_parameters.count("gripper_default_torque_limit")) {
+    gripper_default_torque_limit_ = std::stod(info_.hardware_parameters.at("gripper_default_torque_limit"));
+  }
+  if (info_.hardware_parameters.count("gripper_torque_limit_epsilon")) {
+    gripper_torque_limit_epsilon_ = std::stod(info_.hardware_parameters.at("gripper_torque_limit_epsilon"));
+  }
+  if (info_.hardware_parameters.count("gripper_hold_torque_ff")) {
+    gripper_hold_torque_ff_ = std::stod(info_.hardware_parameters.at("gripper_hold_torque_ff"));
+  }
   if (info_.hardware_parameters.count("use_mock_hardware")) {
     use_mock_hardware_ = info_.hardware_parameters.at("use_mock_hardware") == "true";
   }
@@ -92,6 +109,7 @@ hardware_interface::CallbackReturn RsA3HardwareInterface::on_init(
   hw_commands_positions_.resize(num_joints, 0.0);
   hw_commands_velocities_.resize(num_joints, 0.0);
   hw_commands_efforts_.resize(num_joints, 0.0);
+  last_gripper_torque_limits_.resize(num_joints, -1.0);
   
   // 初始化位置指令平滑滤波（含速度/加速度/加加速度限制 - S 曲线规划）
   smoothed_positions_.resize(num_joints, 0.0);
@@ -172,6 +190,9 @@ hardware_interface::CallbackReturn RsA3HardwareInterface::on_init(
   RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
               "关节限位保护：margin=%.3f rad，stop_margin=%.3f rad，decel_factor=%.2f",
               limit_margin_, limit_stop_margin_, limit_decel_factor_);
+  RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
+              "夹爪保持：default_torque_limit=%.2f Nm，hold_torque_ff=%.3f Nm",
+              gripper_default_torque_limit_, gripper_hold_torque_ff_);
 
   // 初始化调试发布器节点
   debug_node_ = rclcpp::Node::make_shared("el_a3_hw_debug");
@@ -182,6 +203,12 @@ hardware_interface::CallbackReturn RsA3HardwareInterface::on_init(
   temperature_pub_ = debug_node_->create_publisher<sensor_msgs::msg::JointState>("/debug/motor_temperature", 10);
   torque_feedback_pub_ = debug_node_->create_publisher<sensor_msgs::msg::JointState>("/debug/torque_feedback", 10);
   adaptive_kd_pub_ = debug_node_->create_publisher<sensor_msgs::msg::JointState>("/debug/adaptive_kd", 10);
+  gripper_torque_limit_sub_ = debug_node_->create_subscription<std_msgs::msg::Float64>(
+    "/gripper_controller/torque_limit",
+    10,
+    [this](const std_msgs::msg::Float64::SharedPtr msg) {
+      gripper_commanded_torque_limit_.store(std::max(0.0, msg->data));
+    });
   
   RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
               "调试发布器已创建：/debug/hw_command, /debug/smoothed_command, /debug/gravity_torque, "
@@ -330,6 +357,8 @@ hardware_interface::CallbackReturn RsA3HardwareInterface::on_init(
   debug_node_->declare_parameter("zero_torque_kd_max", zero_torque_kd_max_);
   debug_node_->declare_parameter("kd_velocity_ref", kd_velocity_ref_);
   debug_node_->declare_parameter("kd_smoothing_alpha", kd_smoothing_alpha_);
+  debug_node_->declare_parameter("gripper_default_torque_limit", gripper_default_torque_limit_);
+  debug_node_->declare_parameter("gripper_hold_torque_ff", gripper_hold_torque_ff_);
 
   param_callback_handle_ = debug_node_->add_on_set_parameters_callback(
     std::bind(&RsA3HardwareInterface::onParameterChange, this, std::placeholders::_1));
@@ -1111,6 +1140,25 @@ hardware_interface::return_type RsA3HardwareInterface::write(
       motor_kp = std::clamp(joint_kp, 0.0, 500.0);
       motor_kd = std::clamp(joint_kd, 0.0, 5.0);
       cmd_torque = gravity_torque;
+      if (config.name == "L7_joint") {
+        auto params = getMotorParams(config.motor_type);
+        double commanded_limit = gripper_commanded_torque_limit_.load();
+        double requested_limit = commanded_limit > 0.0
+          ? commanded_limit
+          : gripper_default_torque_limit_;
+        requested_limit = std::clamp(requested_limit, 0.0, params.t_max);
+        if (i < last_gripper_torque_limits_.size() &&
+            std::abs(requested_limit - last_gripper_torque_limits_[i]) > gripper_torque_limit_epsilon_) {
+          if (can_driver_->writeParameter(config.motor_id, PARAM_LIMIT_TORQUE, static_cast<float>(requested_limit))) {
+            last_gripper_torque_limits_[i] = requested_limit;
+          }
+        }
+        if (hw_commands_positions_[i] > 0.03 && requested_limit > 0.0) {
+          // L7 angle increases while closing; on this hardware negative torque
+          // is the closing hold direction in joint coordinates.
+          cmd_torque += -std::min(gripper_hold_torque_ff_, requested_limit);
+        }
+      }
       final_cmd_position = cmd_position;
     }
 
@@ -1705,6 +1753,18 @@ rcl_interfaces::msg::SetParametersResult RsA3HardwareInterface::onParameterChang
       kd_smoothing_alpha_ = val;
       RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
                   "动态参数更新 kd_smoothing_alpha = %.3f", val);
+    }
+    else if (name == "gripper_default_torque_limit" && param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      double val = std::clamp(param.as_double(), 0.0, 6.0);
+      gripper_default_torque_limit_ = val;
+      RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
+                  "动态参数更新 gripper_default_torque_limit = %.2f", val);
+    }
+    else if (name == "gripper_hold_torque_ff" && param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      double val = std::clamp(param.as_double(), 0.0, 1.0);
+      gripper_hold_torque_ff_ = val;
+      RCLCPP_INFO(rclcpp::get_logger("RsA3HardwareInterface"),
+                  "动态参数更新 gripper_hold_torque_ff = %.3f", val);
     }
     else {
       result.successful = false;

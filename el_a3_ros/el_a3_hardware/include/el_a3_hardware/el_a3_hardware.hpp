@@ -22,6 +22,7 @@
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/float64.hpp"
 
 #include "el_a3_hardware/robstride_can_driver.hpp"
 
@@ -126,6 +127,7 @@ private:
   std::vector<double> hw_commands_positions_;
   std::vector<double> hw_commands_velocities_;
   std::vector<double> hw_commands_efforts_;
+  std::vector<double> last_gripper_torque_limits_;
   
   // 控制参数
   double position_kp_;
@@ -167,6 +169,10 @@ private:
   // ============ 控制模式（由 controller_manager mode switch 驱动） ============
   std::atomic<bool> effort_mode_{false};  // true = effort (zero-torque), false = position
   double zero_torque_kd_;                 // 零力矩模式固定阻尼系数（adaptive_kd 关闭时的回退值）
+  double gripper_default_torque_limit_;   // L7 默认位置模式力矩上限
+  std::atomic<double> gripper_commanded_torque_limit_{0.0};  // 由 /gripper_controller/torque_limit 更新
+  double gripper_torque_limit_epsilon_;   // L7 力矩上限变化超过该值时才写参数
+  double gripper_hold_torque_ff_;         // L7 闭合保持时的前馈力矩
   
   // ============ 速度自适应 Kd（零力矩模式） ============
   bool   adaptive_kd_enabled_{true};
@@ -260,6 +266,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr temperature_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr torque_feedback_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr adaptive_kd_pub_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr gripper_torque_limit_sub_;
   std::vector<double> filtered_torque_feedback_;  // EMA-filtered torque from motors
 
   // Debug spin thread (keeps debug_node_ timers and parameter callbacks alive)

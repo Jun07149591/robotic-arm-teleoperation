@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from contextlib import ExitStack
 import datetime as dt
 from dataclasses import dataclass, field
 import hashlib
@@ -60,6 +61,10 @@ LATEST_PACKET: dict[str, Any] | None = None
 LAST_PRINT_AT = 0.0
 TOTAL_PACKETS = 0
 SAVE_HANDLE = None
+WS_CLIENTS: set[asyncio.StreamWriter] = set()
+PREVIEW_MAX_BYTES = 2_000_000
+PREVIEW_PACKETS = 0
+LAST_PREVIEW_PRINT_AT = 0.0
 
 
 HTML = r"""<!doctype html>
@@ -246,6 +251,13 @@ HTML = r"""<!doctype html>
     let gl = null;
     let seq = 0;
     let lastSendAt = 0;
+    let previewProgram = null;
+    let previewTexture = null;
+    let previewBuffer = null;
+    let previewImage = null;
+    let previewObjectUrl = null;
+    let previewTextureDirty = false;
+    let previewReady = false;
 
     function setText(id, text) {
       document.getElementById(id).textContent = text;
@@ -337,9 +349,159 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function compileShader(type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(shader) || "shader compile failed");
+      }
+      return shader;
+    }
+
+    function initPreviewRenderer() {
+      const vs = compileShader(gl.VERTEX_SHADER, `
+        attribute vec3 aPosition;
+        attribute vec2 aTexCoord;
+        uniform mat4 uMvp;
+        varying vec2 vTexCoord;
+        void main() {
+          vTexCoord = aTexCoord;
+          gl_Position = uMvp * vec4(aPosition, 1.0);
+        }
+      `);
+      const fs = compileShader(gl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform sampler2D uTexture;
+        void main() {
+          gl_FragColor = texture2D(uTexture, vTexCoord);
+        }
+      `);
+      previewProgram = gl.createProgram();
+      gl.attachShader(previewProgram, vs);
+      gl.attachShader(previewProgram, fs);
+      gl.linkProgram(previewProgram);
+      if (!gl.getProgramParameter(previewProgram, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(previewProgram) || "program link failed");
+      }
+      previewTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, previewTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        2,
+        2,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        new Uint8Array([
+          48, 56, 68, 255, 48, 56, 68, 255,
+          48, 56, 68, 255, 48, 56, 68, 255
+        ])
+      );
+      previewReady = true;
+
+      // World-space panel in WebXR local-floor coordinates. It stays fixed
+      // instead of following head motion. The default local-floor forward
+      // direction is -Z at session start.
+      const vertices = new Float32Array([
+        -1.15, 0.78, -2.10,  0.0, 1.0,
+         1.15, 0.78, -2.10,  1.0, 1.0,
+        -1.15, 1.72, -2.10,  0.0, 0.0,
+         1.15, 1.72, -2.10,  1.0, 0.0,
+      ]);
+      previewBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, previewBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+    }
+
+    function updatePreviewTextureIfNeeded() {
+      if (!previewReady || !previewTextureDirty || !previewImage || !previewTexture) return;
+      gl.bindTexture(gl.TEXTURE_2D, previewTexture);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, previewImage);
+      previewTextureDirty = false;
+    }
+
+    function multiplyMat4(a, b) {
+      const out = new Float32Array(16);
+      for (let col = 0; col < 4; col++) {
+        for (let row = 0; row < 4; row++) {
+          out[col * 4 + row] =
+            a[0 * 4 + row] * b[col * 4 + 0] +
+            a[1 * 4 + row] * b[col * 4 + 1] +
+            a[2 * 4 + row] * b[col * 4 + 2] +
+            a[3 * 4 + row] * b[col * 4 + 3];
+        }
+      }
+      return out;
+    }
+
+    function drawPreviewPanel(view) {
+      if (!previewProgram || !previewTexture || !previewBuffer || !previewReady) return;
+      updatePreviewTextureIfNeeded();
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.useProgram(previewProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, previewTexture);
+      const textureLoc = gl.getUniformLocation(previewProgram, "uTexture");
+      gl.uniform1i(textureLoc, 0);
+      const mvpLoc = gl.getUniformLocation(previewProgram, "uMvp");
+      const viewMatrix = view.transform.inverse.matrix;
+      const mvp = multiplyMat4(view.projectionMatrix, viewMatrix);
+      gl.uniformMatrix4fv(mvpLoc, false, mvp);
+      gl.bindBuffer(gl.ARRAY_BUFFER, previewBuffer);
+      const positionLoc = gl.getAttribLocation(previewProgram, "aPosition");
+      const texCoordLoc = gl.getAttribLocation(previewProgram, "aTexCoord");
+      gl.enableVertexAttribArray(positionLoc);
+      gl.vertexAttribPointer(positionLoc, 3, gl.FLOAT, false, 20, 0);
+      gl.enableVertexAttribArray(texCoordLoc);
+      gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 20, 12);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disable(gl.BLEND);
+    }
+
+    function handlePreviewFrame(arrayBuffer) {
+      const blob = new Blob([arrayBuffer], { type: "image/jpeg" });
+      if ("createImageBitmap" in window) {
+        createImageBitmap(blob).then((bitmap) => {
+          previewImage = bitmap;
+          previewTextureDirty = true;
+          previewReady = true;
+        }).catch(() => {
+          handlePreviewFrameViaImage(blob);
+        });
+        return;
+      }
+      handlePreviewFrameViaImage(blob);
+    }
+
+    function handlePreviewFrameViaImage(blob) {
+      const url = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => {
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+        previewObjectUrl = url;
+        previewImage = image;
+        previewTextureDirty = true;
+        previewReady = true;
+      };
+      image.onerror = () => URL.revokeObjectURL(url);
+      image.src = url;
+    }
+
     function connectWebSocket() {
       const scheme = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(`${scheme}//${location.host}/ws`);
+      ws.binaryType = "arraybuffer";
 
       ws.addEventListener("open", () => {
         wsState.textContent = "connected";
@@ -356,6 +518,12 @@ HTML = r"""<!doctype html>
         wsState.textContent = "disconnected; retrying";
         cls(wsState, "mono warn");
         setTimeout(connectWebSocket, 1000);
+      });
+
+      ws.addEventListener("message", (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          handlePreviewFrame(event.data);
+        }
       });
 
       ws.addEventListener("error", () => {
@@ -397,6 +565,7 @@ HTML = r"""<!doctype html>
         gl = canvas.getContext("webgl", { xrCompatible: true, alpha: false, antialias: false });
         if (!gl) throw new Error("WebGL is unavailable.");
         if (gl.makeXRCompatible) await gl.makeXRCompatible();
+        initPreviewRenderer();
 
         xrSession = await navigator.xr.requestSession("immersive-vr", {
           optionalFeatures: ["local-floor", "bounded-floor"]
@@ -440,12 +609,16 @@ HTML = r"""<!doctype html>
       const layer = xrSession.renderState.baseLayer;
       if (!layer || !viewerPose) return;
       gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      gl.enable(gl.SCISSOR_TEST);
       for (const view of viewerPose.views) {
         const viewport = layer.getViewport(view);
         gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+        gl.scissor(viewport.x, viewport.y, viewport.width, viewport.height);
         gl.clearColor(0.01, 0.02, 0.04, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        drawPreviewPanel(view);
       }
+      gl.disable(gl.SCISSOR_TEST);
     }
 
     function onXRFrame(timestamp, frame) {
@@ -510,6 +683,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw", action="store_true", help="Print each raw JSON pose packet.")
     parser.add_argument("--save", type=Path, help="Save all pose packets as newline-delimited JSON.")
     parser.add_argument("--no-gui", action="store_true", help="Run in terminal-only mode.")
+    parser.add_argument(
+        "--no-camera-preview",
+        action="store_true",
+        help="Do not open RealSense cameras for built-in headset preview.",
+    )
+    parser.add_argument(
+        "--camera-preview-config",
+        type=Path,
+        default=Path("teleop_data_collection/configs/dataset_v1.yaml"),
+        help="Camera config used by built-in headset preview.",
+    )
+    parser.add_argument(
+        "--camera-preview-fps",
+        type=float,
+        default=10.0,
+        help="Built-in headset camera preview FPS (default: 10).",
+    )
+    parser.add_argument(
+        "--camera-preview-scale",
+        type=float,
+        default=0.35,
+        help="Built-in headset camera preview scale before JPEG encoding (default: 0.35).",
+    )
+    parser.add_argument(
+        "--camera-preview-quality",
+        type=int,
+        default=70,
+        help="Built-in headset camera preview JPEG quality, 1-95 (default: 70).",
+    )
     args = parser.parse_args()
     if args.wifi_https:
         args.http = False
@@ -684,6 +886,20 @@ async def send_ws_frame(writer: asyncio.StreamWriter, opcode: int, payload: byte
     await writer.drain()
 
 
+async def broadcast_preview_frame(payload: bytes) -> int:
+    sent = 0
+    dead: list[asyncio.StreamWriter] = []
+    for client in list(WS_CLIENTS):
+        try:
+            await send_ws_frame(client, 0x2, payload)
+            sent += 1
+        except (ConnectionError, OSError, RuntimeError):
+            dead.append(client)
+    for client in dead:
+        WS_CLIENTS.discard(client)
+    return sent
+
+
 async def read_ws_frame(reader: asyncio.StreamReader) -> tuple[bool, int, bytes] | None:
     try:
         b1, b2 = await reader.readexactly(2)
@@ -752,10 +968,14 @@ def handle_text_message(text: str, addr: tuple[str, int], args: argparse.Namespa
     TOTAL_PACKETS += 1
     packet["receivedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
     LATEST_PACKET = packet
-    # Write latest to file for vr_teleop (fast, no HTTP polling needed)
+    # Write latest to file for vr_teleop (fast, no HTTP polling needed).
+    # Use atomic replace so the reader never sees a half-written JSON file.
     try:
-        with open("/tmp/pico_latest_pose.json", "w") as f:
+        latest_path = "/tmp/pico_latest_pose.json"
+        tmp_path = latest_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(packet, f, separators=(",", ":"))
+        os.replace(tmp_path, latest_path)
     except Exception:
         pass
     with APP_STATE.lock:
@@ -812,33 +1032,43 @@ async def handle_websocket(
         ).encode("ascii")
     )
     await writer.drain()
+    WS_CLIENTS.add(writer)
 
-    while True:
-        try:
-            frame = await read_ws_frame(reader)
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            break
-        if frame is None:
-            break
-
-        fin, opcode, payload = frame
-        if opcode == 0x8:
-            await send_ws_frame(writer, 0x8, payload[:125])
-            break
-        if opcode == 0x9:
-            await send_ws_frame(writer, 0xA, payload)
-            continue
-        if opcode == 0x1 and fin:
-            try:
-                handle_text_message(payload.decode("utf-8"), addr, args)
-            except UnicodeDecodeError:
-                pass
-
-    writer.close()
     try:
-        await writer.wait_closed()
-    except OSError:
-        pass
+        while True:
+            try:
+                frame = await read_ws_frame(reader)
+            except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                break
+            if frame is None:
+                break
+
+            fin, opcode, payload = frame
+            if opcode == 0x8:
+                await send_ws_frame(writer, 0x8, payload[:125])
+                break
+            if opcode == 0x9:
+                await send_ws_frame(writer, 0xA, payload)
+                continue
+            if opcode == 0x1 and fin:
+                try:
+                    handle_text_message(payload.decode("utf-8"), addr, args)
+                except UnicodeDecodeError:
+                    pass
+    finally:
+        WS_CLIENTS.discard(writer)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+
+
+def _is_loopback_addr(addr: tuple[str, int]) -> bool:
+    try:
+        return ipaddress.ip_address(str(addr[0])).is_loopback
+    except ValueError:
+        return False
 
 
 async def handle_http_client(
@@ -846,6 +1076,7 @@ async def handle_http_client(
     writer: asyncio.StreamWriter,
     args: argparse.Namespace,
 ) -> None:
+    global PREVIEW_PACKETS, LAST_PREVIEW_PRINT_AT
     peer = writer.get_extra_info("peername")
     addr = peer if isinstance(peer, tuple) else ("unknown", 0)
 
@@ -879,8 +1110,42 @@ async def handle_http_client(
         await handle_websocket(reader, writer, headers, addr, args)
         return
 
+    if method == "POST" and path == "/preview":
+        if not _is_loopback_addr(addr):
+            await send_http_response(writer, "403 Forbidden", "Preview POST is local-only\n")
+            return
+        try:
+            content_length = int(headers.get("content-length", "0"))
+        except ValueError:
+            await send_http_response(writer, "400 Bad Request", "Invalid Content-Length\n")
+            return
+        if content_length <= 0:
+            await send_http_response(writer, "400 Bad Request", "Empty preview body\n")
+            return
+        if content_length > PREVIEW_MAX_BYTES:
+            await send_http_response(writer, "413 Payload Too Large", "Preview frame too large\n")
+            return
+        try:
+            body = await reader.readexactly(content_length)
+        except asyncio.IncompleteReadError:
+            await send_http_response(writer, "400 Bad Request", "Incomplete preview body\n")
+            return
+        sent = await broadcast_preview_frame(body)
+        PREVIEW_PACKETS += 1
+        now = time.monotonic()
+        if now - LAST_PREVIEW_PRINT_AT >= 1.0:
+            LAST_PREVIEW_PRINT_AT = now
+            print(
+                f"preview frames={PREVIEW_PACKETS} size={len(body)} bytes clients={sent}",
+                flush=True,
+            )
+        with APP_STATE.lock:
+            APP_STATE.last_event = f"preview ({sent} clients)"
+        await send_http_response(writer, "204 No Content", b"")
+        return
+
     if method != "GET":
-        await send_http_response(writer, "405 Method Not Allowed", "Only GET is supported\n")
+        await send_http_response(writer, "405 Method Not Allowed", "Only GET/preview POST is supported\n")
         return
 
     if path == "/" or path == "/index.html":
@@ -923,6 +1188,10 @@ def print_startup(args: argparse.Namespace, ips: list[str], https: bool) -> None
     print()
     print("After the page opens, press Enter VR in the headset.")
     print("Coordinate space: +X right, +Y up, -Z forward, relative to the selected WebXR reference space.")
+    if args.no_camera_preview:
+        print("Camera preview: disabled (--no-camera-preview)")
+    else:
+        print("Camera preview: auto RealSense preview enabled")
     if https:
         print("If the page reports secureContext=false, the headset browser does not trust this certificate.")
     print("Press Ctrl+C here to stop.")
@@ -934,6 +1203,136 @@ def build_open_urls(args: argparse.Namespace, ips: list[str]) -> list[str]:
     if args.host in ("127.0.0.1", "localhost"):
         return [f"{scheme}://localhost:{args.port}/"]
     return [f"{scheme}://{ip}:{args.port}/" for ip in ips]
+
+
+def start_camera_preview_thread(
+    args: argparse.Namespace,
+    loop: asyncio.AbstractEventLoop,
+) -> threading.Event | None:
+    if args.no_camera_preview:
+        return None
+
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        try:
+            repo_root = Path(__file__).resolve().parent
+            sdk_root = repo_root / "el_a3_sdk"
+            for path in (str(repo_root), str(sdk_root)):
+                while path in sys.path:
+                    sys.path.remove(path)
+            sys.path.insert(0, str(repo_root))
+            sys.path.insert(0, str(sdk_root))
+
+            from teleop_data_collection.lib.camera import make_camera
+            from teleop_data_collection.lib.config import load_config, resolve_camera_configs
+            import cv2
+            import numpy as np
+
+            def build_preview_image(image_frames: dict[str, Any], camera_order: list[str]) -> Any:
+                ordered_frames = [image_frames[name] for name in camera_order if name in image_frames]
+                target_height = max(frame.shape[0] for frame in ordered_frames)
+                resized = []
+                for frame in ordered_frames:
+                    height, width = frame.shape[:2]
+                    if height != target_height:
+                        resize_scale = target_height / float(height)
+                        frame = cv2.resize(
+                            frame,
+                            (int(round(width * resize_scale)), target_height),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    resized.append(frame)
+                spacer = np.full((target_height, 12, 3), 32, dtype=np.uint8)
+                preview = np.concatenate(
+                    [part for index, frame in enumerate(resized)
+                     for part in ((spacer, frame) if index else (frame,))],
+                    axis=1,
+                )
+                scale = max(float(args.camera_preview_scale), 0.05)
+                if abs(scale - 1.0) > 1e-6:
+                    height, width = preview.shape[:2]
+                    preview = cv2.resize(
+                        preview,
+                        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                return preview
+
+            def encode_preview_jpeg(preview_rgb: Any) -> bytes:
+                quality = int(max(1, min(95, int(args.camera_preview_quality))))
+                preview_bgr = cv2.cvtColor(preview_rgb, cv2.COLOR_RGB2BGR)
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    preview_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+                )
+                if not ok:
+                    raise RuntimeError("failed to encode preview JPEG")
+                return encoded.tobytes()
+
+            cfg = load_config(args.camera_preview_config)
+            camera_configs = resolve_camera_configs(cfg.camera)
+            if not camera_configs:
+                print("[camera-preview] no camera config found; disabled", flush=True)
+                return
+            cameras = {str(cam.get("name", f"camera{idx}")): make_camera(cam)
+                       for idx, cam in enumerate(camera_configs)}
+            camera_order = list(cameras.keys())
+
+            with ExitStack() as stack:
+                for camera in cameras.values():
+                    stack.enter_context(camera)
+                for camera in cameras.values():
+                    camera.warmup(frame_count=30, timeout_ms=5000)
+
+                print(
+                    f"[camera-preview] streaming {camera_order} "
+                    f"at {args.camera_preview_fps:.1f}fps",
+                    flush=True,
+                )
+                interval = 1.0 / max(float(args.camera_preview_fps), 1e-6)
+                last_print = 0.0
+                frame_count = 0
+                while not stop_event.is_set():
+                    loop_start = time.monotonic()
+                    frames = {
+                        name: camera.get_frame(timeout_ms=5000).color_rgb
+                        for name, camera in cameras.items()
+                    }
+                    preview_rgb = build_preview_image(
+                        frames,
+                        camera_order,
+                    )
+                    payload = encode_preview_jpeg(preview_rgb)
+                    future = asyncio.run_coroutine_threadsafe(
+                        broadcast_preview_frame(payload),
+                        loop,
+                    )
+                    try:
+                        clients = future.result(timeout=0.3)
+                    except Exception:
+                        clients = 0
+                    frame_count += 1
+                    now = time.monotonic()
+                    if now - last_print >= 2.0:
+                        last_print = now
+                        print(
+                            f"[camera-preview] frames={frame_count} "
+                            f"size={len(payload)} bytes clients={clients}",
+                            flush=True,
+                        )
+                    elapsed = time.monotonic() - loop_start
+                    if elapsed < interval:
+                        stop_event.wait(interval - elapsed)
+        except Exception as exc:
+            with APP_STATE.lock:
+                APP_STATE.last_event = "camera preview disabled"
+            print(f"[camera-preview] disabled: {exc}", flush=True)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return stop_event
 
 
 async def run_server(args: argparse.Namespace) -> None:
@@ -982,8 +1381,14 @@ async def run_server(args: argparse.Namespace) -> None:
         APP_STATE.server_urls = urls
         APP_STATE.last_event = "server running"
 
-    async with server:
-        await server.serve_forever()
+    camera_stop = start_camera_preview_thread(args, asyncio.get_running_loop())
+
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if camera_stop is not None:
+            camera_stop.set()
 
 
 def run_server_thread(args: argparse.Namespace) -> None:
